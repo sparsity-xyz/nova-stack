@@ -1,0 +1,15 @@
+{
+  "wallets": [
+    {
+      "rngContractAddress": "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
+      "novaRegistryAddress": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      "teeWalletAddress": "0x9c961618782BC106d5DFF45046D8760E8524C3A8",
+      "registeredBy": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+      "registeredAt": "2025-12-17T05:47:18.497Z",
+      "network": "localhost",
+      "txHash": "0xae4eb8d6ecd01f91f7f66f608d7d6c4526d165bae60b4bbcbe420517ea4e317f",
+      "blockNumber": 5,
+      "isOperator": true
+    }
+  ]
+}

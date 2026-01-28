@@ -1,0 +1,33 @@
+# Hardhat
+node_modules/
+cache/
+artifacts/
+coverage/
+typechain-types/
+
+# Environment variables
+.env
+.env.local
+
+# Deployment files
+rng-deployment.json
+operator-info.json
+
+# Python
+rng-backend/__pycache__/
+rng-backend/*.pyc
+rng-backend/venv/
+rng-backend/env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

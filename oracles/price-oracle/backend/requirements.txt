@@ -1,0 +1,7 @@
+flask==3.1.2
+requests==2.31.0
+eth_account==0.13.7
+eth-utils==5.3.1
+rlp==4.1.0
+eth-rlp>=2.1.0
+web3==7.14.0
