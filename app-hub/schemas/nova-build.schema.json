@@ -1,0 +1,111 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/sparsity-xyz/sparsity-nova-app-hub/schemas/nova-build.schema.json",
+  "title": "Nova Build Configuration",
+  "description": "Schema for Nova App Hub build configuration files. Enclaver configuration is in separate enclaver.yaml file.",
+  "type": "object",
+  "required": [
+    "name",
+    "version",
+    "repo",
+    "ref"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Application name (lowercase letters, numbers, and hyphens only)",
+      "pattern": "^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$",
+      "minLength": 1,
+      "maxLength": 63
+    },
+    "version": {
+      "type": "string",
+      "description": "Semantic version (e.g., 1.0.0)",
+      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(-[a-zA-Z0-9-]+(\\.[a-zA-Z0-9-]+)*)?(\\+[a-zA-Z0-9-]+(\\.[a-zA-Z0-9-]+)*)?$"
+    },
+    "repo": {
+      "type": "string",
+      "description": "Public GitHub repository URL (must start with https://github.com/)",
+      "pattern": "^https://github\\.com/[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(\\.git)?$"
+    },
+    "ref": {
+      "type": "string",
+      "description": "Git reference (branch name, tag name, or commit SHA)",
+      "minLength": 1
+    },
+    "build": {
+      "type": "object",
+      "description": "Build configuration options",
+      "additionalProperties": false,
+      "properties": {
+        "directory": {
+          "type": "string",
+          "description": "Directory containing Dockerfile (relative to repo root)",
+          "default": "."
+        },
+        "dockerfile": {
+          "type": "string",
+          "description": "Dockerfile name",
+          "default": "Dockerfile"
+        },
+        "args": {
+          "type": "array",
+          "description": "Docker build arguments",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "value"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Build argument name"
+              },
+              "value": {
+                "type": "string",
+                "description": "Build argument value"
+              }
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Application metadata",
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Brief description of the application",
+          "maxLength": 500
+        },
+        "maintainer": {
+          "type": "string",
+          "description": "Maintainer email address",
+          "format": "email"
+        },
+        "homepage": {
+          "type": "string",
+          "description": "Project homepage URL",
+          "format": "uri"
+        },
+        "license": {
+          "type": "string",
+          "description": "License identifier (e.g., MIT, Apache-2.0)"
+        },
+        "tags": {
+          "type": "array",
+          "description": "Additional image tags",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]*$"
+          }
+        }
+      }
+    }
+  }
+}

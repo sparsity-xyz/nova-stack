@@ -1,0 +1,171 @@
+# Nova App Hub - PR Validation Workflow
+# This workflow validates pull request submissions
+
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/**'
+
+jobs:
+  validate-changes:
+    name: Validate PR Changes
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            apps/**
+      
+      - name: Check for unauthorized file changes
+        run: |
+          echo "Changed files: ${{ steps.changed-files.outputs.all_changed_files }}"
+          
+          # Only allow changes in apps/ directory
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            if [[ ! "$file" =~ ^apps/ ]]; then
+              echo "ERROR: Changes outside apps/ directory are not allowed: $file"
+              exit 1
+            fi
+            
+            # Only allow essential configuration and info files
+            if [[ ! "$file" =~ /(nova-build\.yaml|enclaver\.yaml|BUILD_INFO\.md)$ ]]; then
+              echo "ERROR: Only nova-build.yaml, enclaver.yaml, and BUILD_INFO.md files are allowed: $file"
+              exit 1
+            fi
+          done
+          
+          echo "✅ All changed files are valid"
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: Install validation tools
+        run: |
+          npm install -g ajv-cli
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+      
+      - name: Validate nova-build.yaml files
+        run: |
+          SCHEMA_FILE="schemas/nova-build.schema.json"
+          
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            if [[ ! "$file" =~ /nova-build\.yaml$ ]]; then
+              echo "Skipping non-build config file: $file"
+              continue
+            fi
+            
+            echo "=========================================="
+            echo "Validating: $file"
+            echo "=========================================="
+            
+            # Convert YAML to JSON and write to temp file with .json extension
+            TEMP_JSON=$(mktemp --suffix=.json)
+            yq eval -o=json "$file" > "$TEMP_JSON"
+            
+            # Validate against schema using temp file (stdin doesn't work reliably in GHA)
+            ajv validate -s "$SCHEMA_FILE" -d "$TEMP_JSON" --strict=false
+            
+            # Read JSON content for further processing
+            JSON_CONTENT=$(cat "$TEMP_JSON")
+            rm -f "$TEMP_JSON"
+            
+            # Extract values
+            NAME=$(echo "$JSON_CONTENT" | jq -r '.name')
+            REPO=$(echo "$JSON_CONTENT" | jq -r '.repo')
+            BRANCH=$(echo "$JSON_CONTENT" | jq -r '.branch')
+            DIRECTORY=$(echo "$JSON_CONTENT" | jq -r '.build.directory // "."')
+            DOCKERFILE=$(echo "$JSON_CONTENT" | jq -r '.build.dockerfile // "Dockerfile"')
+            
+            # Normalize DIRECTORY path:
+            # - Remove leading "./" if present
+            # - Remove trailing "/" if present  
+            # - Handle "." as special case for repo root
+            DIRECTORY=$(echo "$DIRECTORY" | sed 's|^\./||' | sed 's|/$||')
+            if [ -z "$DIRECTORY" ]; then
+              DIRECTORY="."
+            fi
+            echo "Normalized directory: $DIRECTORY"
+            
+            # Validate directory name matches app name
+            DIR_NAME=$(dirname "$file" | xargs basename)
+            if [ "$DIR_NAME" != "$NAME" ]; then
+              echo "ERROR: Directory name '$DIR_NAME' must match app name '$NAME'"
+              exit 1
+            fi
+            
+            # Validate repo is public GitHub URL
+            if [[ ! "$REPO" =~ ^https://github\.com/ ]]; then
+              echo "ERROR: Repository must be a public GitHub URL"
+              exit 1
+            fi
+            
+            # Remove .git suffix if present for API call
+            REPO_PATH=$(echo "$REPO" | sed 's|https://github.com/||' | sed 's|\.git$||')
+            
+            # Check if repository is accessible
+            echo "Checking repository: $REPO"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://api.github.com/repos/$REPO_PATH")
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "ERROR: Repository not accessible or not public (HTTP $HTTP_CODE)"
+              exit 1
+            fi
+            
+            # Build Dockerfile path for API check
+            if [ "$DIRECTORY" = "." ]; then
+              DOCKERFILE_PATH="$DOCKERFILE"
+            else
+              DOCKERFILE_PATH="$DIRECTORY/$DOCKERFILE"
+            fi
+            
+            # Verify Dockerfile exists in the repository
+            echo "Verifying Dockerfile exists at: $DOCKERFILE_PATH"
+            DOCKERFILE_URL="https://api.github.com/repos/$REPO_PATH/contents/$DOCKERFILE_PATH?ref=$BRANCH"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$DOCKERFILE_URL")
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "ERROR: Dockerfile not found at $DOCKERFILE_PATH in branch $BRANCH (HTTP $HTTP_CODE)"
+              exit 1
+            fi
+            
+            # Check enclave debug_mode setting
+            DEBUG_MODE=$(echo "$JSON_CONTENT" | jq -r '.enclave.debug_mode // false')
+            if [ "$DEBUG_MODE" = "true" ]; then
+              echo "⚠️  WARNING: debug_mode is enabled - PCR values will differ from production builds"
+            fi
+            
+            # Validate reproducible settings if present
+            REPRODUCIBLE_ENABLED=$(echo "$JSON_CONTENT" | jq -r '.reproducible.enabled // true')
+            SOURCE_DATE_EPOCH=$(echo "$JSON_CONTENT" | jq -r '.reproducible.source_date_epoch // empty')
+            
+            if [ "$REPRODUCIBLE_ENABLED" = "true" ] && [ -z "$SOURCE_DATE_EPOCH" ]; then
+              echo "ℹ️  INFO: reproducible.source_date_epoch not set, will use commit timestamp"
+            fi
+            
+            echo "✅ Validation passed for $file"
+            echo ""
+          done
+      
+      - name: Summary
+        run: |
+          echo "## PR Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ All validations passed!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Validated Files:" >> $GITHUB_STEP_SUMMARY
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            echo "- \`$file\`" >> $GITHUB_STEP_SUMMARY
+          done
+
