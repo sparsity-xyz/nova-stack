@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Nova App Hub - AWS Infrastructure for Docker Image Storage and EIF Artifacts'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nova-app-hub
+    Description: Project name prefix for all resources
+  
+  ECRRepositoryPrefix:
+    Type: String
+    Default: nova-apps
+    Description: Prefix for ECR repositories
+  
+  GitHubOrg:
+    Type: String
+    Default: sparsity-xyz
+    Description: GitHub organization name
+  
+  GitHubRepo:
+    Type: String
+    Default: sparsity-nova-app-hub
+    Description: GitHub repository name
+
+Resources:
+  #############################################
+  # S3 Bucket for Build Artifacts
+  #############################################
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-artifacts-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldBuilds
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  #############################################
+  # ECR Repository for Docker Images
+  #############################################
+  # Note: Individual app repositories are created dynamically by the workflow
+  # This is a base repository for shared images if needed
+  
+  #############################################
+  # IAM User for GitHub Actions
+  #############################################
+  GitHubActionsUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub '${ProjectName}-github-actions'
+      Policies:
+        - PolicyName: GitHubActionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ECR Access
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeRepositories
+                  - ecr:CreateRepository
+                  - ecr:SetRepositoryPolicy
+                  - ecr:PutImageScanningConfiguration
+                Resource:
+                  - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepositoryPrefix}/*'
+              
+              # S3 Access
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub '${ArtifactsBucket.Arn}/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GitHubActionsAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref GitHubActionsUser
+
+Outputs:
+  ArtifactsBucketName:
+    Description: S3 bucket for build artifacts
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub '${ProjectName}-artifacts-bucket'
+  
+  ArtifactsBucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt ArtifactsBucket.Arn
+  
+  GitHubActionsAccessKeyId:
+    Description: Access Key ID for GitHub Actions (store in GitHub Secrets as AWS_ACCESS_KEY_ID)
+    Value: !Ref GitHubActionsAccessKey
+  
+  GitHubActionsSecretAccessKey:
+    Description: Secret Access Key for GitHub Actions (store in GitHub Secrets as AWS_SECRET_ACCESS_KEY)
+    Value: !GetAtt GitHubActionsAccessKey.SecretAccessKey
+  
+  ECRRegistryUrl:
+    Description: ECR Registry URL
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+  
+  ECRRepositoryPrefix:
+    Description: ECR Repository Prefix
+    Value: !Ref ECRRepositoryPrefix
+  
+  AWSRegion:
+    Description: AWS Region
+    Value: !Ref AWS::Region
+
+  # Instructions for setup
+  SetupInstructions:
+    Description: Instructions for completing setup
+    Value: |
+      1. Deploy this CloudFormation stack
+      2. Copy GitHubActionsAccessKeyId and GitHubActionsSecretAccessKey to GitHub Secrets
+      3. Update .github/workflows/build-on-merge.yml with:
+         - AWS_REGION: <AWSRegion output>
+         - ECR_REGISTRY: <ECRRegistryUrl output>
+         - ECR_REPOSITORY_PREFIX: <ECRRepositoryPrefix output>
+         - S3_BUCKET: <ArtifactsBucketName output>
