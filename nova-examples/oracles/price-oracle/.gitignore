@@ -1,0 +1,5 @@
+contracts/out/
+contracts/cache/
+contracts/lib/
+contracts/broadcast/Deploy.s.sol/31337
+.env

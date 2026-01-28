@@ -1,0 +1,20 @@
+version: v1
+name: "secured-chat-bot"
+target: "secured-chat-bot-enclave:latest"
+sources:
+  app: "secured-chat-bot:latest"
+  # odyn: "odyn-dev:latest"
+  # sleeve: "enclaver-wrapper-base-dev:latest"
+defaults:
+  memory_mb: 2048
+ingress:
+  - listen_port: 8000
+egress:
+  allow:
+    - "api.openai.com"
+    - "api.anthropic.com"
+    - "generativelanguage.googleapis.com"
+api:
+  listen_port: 18000
+aux_api:
+  listen_port: 18001

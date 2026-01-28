@@ -1,0 +1,19 @@
+{
+  "name": "rng-oracle-contract",
+  "version": "1.0.0",
+  "description": "Random Number Generator Contract for Sparsity Nova Platform",
+  "scripts": {
+    "compile": "hardhat compile",
+    "deploy:local": "hardhat run scripts/deploy-rng.js --network localhost",
+    "deploy:sepolia": "hardhat run scripts/deploy-rng.js --network baseSepolia",
+    "test:local": "hardhat run scripts/test-request.js --network localhost",
+    "check:local": "hardhat run scripts/check-results.js --network localhost",
+    "verify": "hardhat verify --network baseSepolia"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@openzeppelin/contracts": "^5.0.0",
+    "dotenv": "^16.3.1",
+    "hardhat": "^2.22.0"
+  }
+}
