@@ -19,7 +19,7 @@ The Nova ecosystem consists of several specialized components that work together
 
 ### 1. Enclaver
 **The Engine**  
-[https://github.com/sparsity-xyz/enclaver/](https://github.com/sparsity-xyz/enclaver/)
+[./enclaver/](./enclaver/)
 
 Enclaver is the core toolkit that simplifies packaging and running applications inside AWS Nitro Enclaves. It builds a docker image into an Enclave Image File (EIF) and provides a runtime supervisor called **Odyn** that runs inside the enclave.
 
@@ -34,9 +34,10 @@ Enclaver is the core toolkit that simplifies packaging and running applications 
     *   **Key Management**: Signing transactions with enclave-generated keys.
     *   **Encryption**: ECIES (ECDH + AES-GCM) for secure communication with clients.
     *   **Randomness**: Hardware-based true random number generation from the NSM.
+
 ### 2. Nova App Hub
 **The Transparent Builder**  
-[https://github.com/sparsity-xyz/sparsity-nova-app-hub](https://github.com/sparsity-xyz/sparsity-nova-app-hub)
+[./app-hub/](./app-hub/)
 
 A centralized, transparent build platform. Applications submitted here are built publicly using GitHub Actions. This ensures that the binary running in the enclave matches the source code, creating a "chain of custody" for the software supply chain.
 - **SLSA Level 3**: Builds are signed and verifiable.
@@ -44,7 +45,7 @@ A centralized, transparent build platform. Applications submitted here are built
 
 ### 3. Nova Examples
 **The Reference**  
-[https://github.com/sparsity-xyz/sparsity-nova-examples](https://github.com/sparsity-xyz/sparsity-nova-examples)
+[./nova-examples/](./nova-examples/)
 
 A collection of reference applications demonstrating how to use the Nova Stack. Includes examples for:
 - Secure Chat Bots (End-to-end encryption)
@@ -53,7 +54,7 @@ A collection of reference applications demonstrating how to use the Nova Stack. 
 
 ### 4. Nova App Template
 **The Starter**  
-[https://github.com/sparsity-xyz/nova-app-template](https://github.com/sparsity-xyz/nova-app-template)
+[./nova-app-template/](./nova-app-template/)
 
 The standard boilerplate for creating new Nova applications. It comes pre-configured with:
 - **FastAPI / Python** backend structure.
