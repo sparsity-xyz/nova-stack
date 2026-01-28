@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - sparsity
+  pull_request:
+    branches:
+      - sparsity
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: "sparse"
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  clippy-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse MSRV
+        run: sed -n 's/^rust-version = "\(.*\)"$/RUSTUP_TOOLCHAIN=\1/p' enclaver/Cargo.toml >> $GITHUB_ENV
+
+      - name: Install Rust Toolchain
+        run: rustup toolchain install $RUSTUP_TOOLCHAIN
+
+      - name: Install Clippy and Rustfmt
+        run: rustup component add clippy rustfmt
+
+      - name: Check with default features
+        run: |
+          cargo clippy --quiet --no-deps --manifest-path enclaver/Cargo.toml
+
+      - name: Check all binaries
+        run: |
+          cargo clippy --quiet --no-deps --manifest-path enclaver/Cargo.toml --features=run_enclave,odyn
+
+      - name: Check with tracing enabled
+        env:
+          RUSTFLAGS: "--cfg=tokio_unstable"
+        run: |
+          cargo clippy --quiet --no-deps --manifest-path enclaver/Cargo.toml --features=run_enclave,odyn,tracing
+
+  ## TODO: Add test job here?

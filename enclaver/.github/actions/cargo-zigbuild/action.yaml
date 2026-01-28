@@ -1,0 +1,13 @@
+# action.yml
+name: 'Cargo + Zig'
+description: 'Build with Cargo + Zig'
+inputs:
+  args:
+    description: 'Build arguments'
+    required: false
+    default: ''
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  args:
+    - ${{ inputs.args }}
