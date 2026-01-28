@@ -1,0 +1,5 @@
+.idea
+
+*.lock
+
+**_pycache__

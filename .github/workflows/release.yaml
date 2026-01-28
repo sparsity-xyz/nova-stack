@@ -1,0 +1,247 @@
+name: Build Release
+
+on:
+  push:
+    branches:
+      - sparsity
+    tags:
+      - v*
+  workflow_dispatch:
+    inputs:
+      publish_images:
+        description: 'Set to "true" to run the publish-images job when manually triggered'
+        required: false
+        default: 'false'
+      upload_artifacts:
+        description: 'Set to "true" to run the upload-release-artifact job when manually triggered'
+        required: false
+        default: 'false'
+      repo:
+        description: 'Repository to use for publish/upload checks (owner/repo). Useful for testing.'
+        required: false
+        default: 'sparsity-xyz/enclaver'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-release-binaries:
+    strategy:
+      matrix:
+        include:
+          - target: 'x86_64-unknown-linux-musl'
+            host: 'ubuntu-latest'
+            uses_musl: true
+            extra_cargo_args: '--features=run_enclave,odyn'
+          - target: 'aarch64-unknown-linux-musl'
+            host: 'ubuntu-latest'
+            uses_musl: true
+            extra_cargo_args: '--features=run_enclave,odyn'
+
+    runs-on: ${{ matrix.host }}
+
+    permissions:
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "enclaver -> target"
+          key: ${{ matrix.target }}
+
+      - name: Build Release Binaries (native cargo)
+        if: ${{ !matrix.uses_musl }}
+        run: |
+          cargo build \
+          --target ${{ matrix.target }} \
+          --manifest-path enclaver/Cargo.toml \
+          --release \
+          ${{ matrix.extra_cargo_args }}
+
+      - name: Build Release Binaries (cargo-zigbuild)
+        if: ${{ matrix.uses_musl }}
+        uses: ./.github/actions/cargo-zigbuild
+        with:
+          args: |
+            --target ${{ matrix.target }}
+            --manifest-path enclaver/Cargo.toml
+            --release
+            ${{ matrix.extra_cargo_args }}
+
+      - name: Generate a SLSA provenance attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: "enclaver/target/*/release/enclaver"
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            enclaver/target/${{ matrix.target }}/release/enclaver
+            enclaver/target/${{ matrix.target }}/release/enclaver-run
+            enclaver/target/${{ matrix.target }}/release/odyn
+
+
+  publish-images:
+    if: >
+      (github.repository == 'sparsity-xyz/enclaver' && (github.ref == 'refs/heads/sparsity' || github.ref_type == 'tag'))
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_images == 'true')
+    needs: build-release-binaries
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      attestations: 'write'
+
+    env:
+      ODYN_IMAGE: public.ecr.aws/d4t4u8d2/sparsity-ai/odyn
+      SLEEVE_IMAGE: public.ecr.aws/d4t4u8d2/sparsity-ai/sleeve
+
+    steps:
+      - name: Download Binaries
+        uses: actions/download-artifact@v4
+
+      # Putting the binaries into a path whose name exactly matches Docker's
+      # architecture naming conventions makes it easy for the Dockerfiles to
+      # COPY architecture-specific files into the image in a nice, cacheable
+      # way.
+      - name: Re-Arrange Binaries
+        shell: bash
+        run: |
+          mv x86_64-unknown-linux-musl amd64
+          mv aarch64-unknown-linux-musl arm64
+          chmod 755 amd64/odyn amd64/enclaver-run arm64/odyn arm64/enclaver-run
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Configure AWS credentials from OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-region: us-east-1
+          role-to-assume: arn:aws:iam::004118891089:role/Github-Workflow-Publish-AWS-ECR
+
+      - name: Login to Amazon ECR Public
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+        with:
+          registry-type: public
+
+      - name: Generate Odyn Image Metadata
+        id: odyn-metadata
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.ODYN_IMAGE }}
+          tags: |
+            type=sha,
+            type=semver,pattern=v{{major}},enable=${{ github.ref_type == 'tag' }}
+            type=semver,pattern=v{{major}}.{{minor}},enable=${{ github.ref_type == 'tag' }}
+            type=semver,pattern=v{{major}}.{{minor}}.{{patch}},enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+
+      - name: Build Odyn Image
+        id: odyn-build-image
+        uses: docker/build-push-action@v5
+        with:
+          context: "{{defaultContext}}:dockerfiles"
+          build-contexts: artifacts=.
+          file: odyn-release.dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.odyn-metadata.outputs.tags }}
+
+      - name: Generate SLSA provenance for Odyn
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.ODYN_IMAGE }}
+          subject-digest: ${{ steps.odyn-build-image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate Sleeve Image Metadata
+        id: sleeve-metadata
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.SLEEVE_IMAGE }}
+          tags: |
+            type=sha,
+            type=semver,pattern=v{{major}},enable=${{ github.ref_type == 'tag' }}
+            type=semver,pattern=v{{major}}.{{minor}},enable=${{ github.ref_type == 'tag' }}
+            type=semver,pattern=v{{major}}.{{minor}}.{{patch}},enable=${{ github.ref_type == 'tag' }}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+
+      - name: Build Sleeve Image
+        id: sleeve-build-image
+        uses: docker/build-push-action@v5
+        with:
+          context: "{{defaultContext}}:dockerfiles"
+          build-contexts: artifacts=.
+          file: sleeve-release.dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.sleeve-metadata.outputs.tags }}
+
+      - name: Generate SLSA provenance for Sleeve
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.SLEEVE_IMAGE }}
+          subject-digest: ${{ steps.sleeve-build-image.outputs.digest }}
+          push-to-registry: true
+
+  upload-release-artifact:
+    if: >
+      (github.repository == 'sparsity-xyz/enclaver' && github.ref_type == 'tag')
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.upload_artifacts == 'true')
+    needs: build-release-binaries
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: 'write'
+
+    strategy:
+      matrix:
+        include:
+          - target: 'x86_64-unknown-linux-musl'
+            release_name: 'enclaver-linux-x86_64'
+            delay: 60
+          - target: 'aarch64-unknown-linux-musl'
+            release_name: 'enclaver-linux-aarch64'
+            delay: 120
+
+    steps:
+      - name: Download Binaries
+        uses: actions/download-artifact@v4
+
+      - name: Construct Release Artifact
+        shell: bash
+        run: |
+          echo Delaying for ${{ matrix.delay }} secs
+          sleep ${{ matrix.delay }}
+          echo Proceeding
+
+          release_dir="${{ matrix.release_name }}-${{ github.ref_name }}"
+
+          mkdir ${release_dir}
+          mv ${{ matrix.target }}/enclaver ${release_dir}/enclaver
+          chmod 755 ${release_dir}/enclaver
+          tar -czf ${release_dir}.tar.gz ${release_dir}
+          sha256sum ${release_dir}.tar.gz > ${release_dir}.tar.gz.sha256
+
+      - name: Upload Artifact to GH Release
+        uses: softprops/action-gh-release@v1
+        with:
+          draft: true
+          tag_name: ${{ github.ref_name }}
+          files: |
+            ${{ matrix.release_name }}-${{ github.ref_name }}.tar.gz
+            ${{ matrix.release_name }}-${{ github.ref_name }}.tar.gz.sha256
+
