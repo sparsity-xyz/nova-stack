@@ -4,7 +4,7 @@ The **Nova Stack** is a comprehensive, self-contained suite of open-source tools
 
 With Nova Stack, you can independently develop, build, deploy, and register TEE applications **without relying on any managed platform**. You own and control the entire pipeline.
 
-## System Overview
+## Stack Overview
 
 Nova Stack consists of four core components that together provide a complete, end-to-end workflow for confidential computing applications.
 
@@ -15,21 +15,21 @@ Nova Stack consists of four core components that together provide a complete, en
 │                             NOVA STACK PIPELINE                                          │
 ├──────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                          │
-│   1. DEVELOP              2. BUILD               3. DEPLOY             4. REGISTER      │
+│   1. DEVELOP              2. BUILD               3. DEPLOY             4. REGISTER       │
 │   ──────────              ────────               ────────              ────────────      │
-│   ┌────────────┐          ┌────────────┐         ┌────────────┐        ┌────────────┐   │
-│   │  Enclaver  │  ──────▶ │  App Hub   │ ──────▶ │  Enclaver  │ ─────▶ │  ZKP CLI   │   │
-│   │            │          │            │         │            │        │            │   │
-│   │ Build &    │          │ Transparent│         │ Run your   │        │ Attest,    │   │
-│   │ test your  │          │ CI/CD build│         │ EIF on AWS │        │ Prove &    │   │
-│   │ TEE app    │          │ with proofs│         │ Nitro      │        │ Register   │   │
-│   └────────────┘          └────────────┘         └────────────┘        └─────┬──────┘   │
-│                                                                              │          │
-│                                                                              ▼          │
-│                                                                        ┌────────────┐   │
-│                                                                        │App Registry│   │
-│                                                                        │ (On-Chain) │   │
-│                                                                        └────────────┘   │
+│   ┌────────────┐          ┌────────────┐         ┌────────────┐        ┌────────────┐    │
+│   │  Enclaver  │  ──────▶ │  App Hub   │ ──────▶ │  Enclaver  │ ─────▶ │  ZKP CLI   │    │
+│   │            │          │            │         │            │        │            │    │
+│   │ Build &    │          │ Transparent│         │ Run your   │        │ Attest,    │    │
+│   │ test your  │          │ CI/CD build│         │ EIF on AWS │        │ Prove &    │    │
+│   │ TEE app    │          │ with proofs│         │ Nitro      │        │ Register   │    │
+│   └────────────┘          └────────────┘         └────────────┘        └─────┬──────┘    │
+│                                                                              │           │
+│                                                                              ▼           │
+│                                                                        ┌────────────┐    │
+│                                                                        │App Registry│    │
+│                                                                        │ (On-Chain) │    │
+│                                                                        └────────────┘    │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -92,7 +92,6 @@ A transparent build system using GitHub Actions. Applications submitted here are
 ### 3. App Registry
 **The On-Chain Registry**  
 [./app-registry/](./app-registry/)  
-*Original Repo: [https://github.com/sparsity-xyz/nova-contracts](https://github.com/sparsity-xyz/nova-contracts)*
 
 Smart contracts for on-chain TEE application registration and verification. Deploy your own instance of the registry or use an existing deployment.
 
@@ -159,7 +158,8 @@ A command-line tool for the final step of the deployment pipeline. It connects t
 ## Resources
 
 - [How It Works](https://sparsity.cloud/how-it-works)
+- [Nova App Template](https://github.com/sparsity-xyz/nova-app-template)
+- [Nova App Examples](https://github.com/sparsity-xyz/sparsity-nova-examples)
 - [Enclaver Documentation](./enclaver/docs/)
 - [App Registry Documentation](./app-registry/README.md)
-- [Nova Examples](https://github.com/sparsity-xyz/sparsity-nova-examples)
 - [Sparsity Cloud](https://sparsity.cloud) - Optional managed platform for simplified deployment
