@@ -42,19 +42,6 @@ Learn more about this workflow at [https://sparsity.cloud/how-it-works](https://
 
 ---
 
-## Getting Started
-
-### 1. Clone the Repository
-
-To get started with Nova Stack, clone the repository:
-
-```bash
-git clone https://github.com/sparsity-xyz/nova-stack.git
-cd nova-stack
-```
-
----
-
 ## Core Components
 
 ### 1. Enclaver
