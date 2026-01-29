@@ -1,6 +1,0 @@
-uvicorn==0.38.0
-fastapi==0.121.1
-web3==7.14.0
-eth_account==0.13.7
-requests>=2.31.0
-cryptography>=41.0.0

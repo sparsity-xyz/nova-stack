@@ -1,7 +1,0 @@
-{
-  "rpc_url": "https://sepolia.base.org",
-  "contract_address": "0x00061d46a5d05f1abdec7ea05894e602083682e9",
-  "update_interval_seconds": 300,
-  "chain_id": 84532,
-  "coingecko_url": "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-}

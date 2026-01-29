@@ -1,32 +1,72 @@
 # Nova Stack
 
-The **Nova Stack** is a comprehensive suite of tools designed to build, deploy, and verify Trusted Execution Environment (TEE) applications on AWS Nitro Enclaves.
+The **Nova Stack** is a comprehensive, self-contained suite of open-source tools for building, deploying, and verifying Trusted Execution Environment (TEE) applications on AWS Nitro Enclaves.
 
-It unifies the entire lifecycle of a confidential application: from local development and packaging to transparent building and verifiable on-chain registration.
+With Nova Stack, you can independently develop, build, deploy, and register TEE applications **without relying on any managed platform**. You own and control the entire pipeline.
 
 ## System Overview
 
-The Nova ecosystem consists of several specialized components that work together to ensure that applications are not only secure but also **transparently built** and **verifiable**.
+Nova Stack consists of four core components that together provide a complete, end-to-end workflow for confidential computing applications.
 
-### The Flow
-1. **Develop**: Use the **Nova App Template** and **Enclaver** to build and test your TEE application locally.
-2. **Build**: Push to **App Hub**, where your application is transparently built via GitHub Actions, producing a verifiable measurement (PCR0).
-3. **Deploy**: Use the **Nova Platform** to deploy your application to the cloud. The platform generates a Zero-Knowledge Proof (ZKP) of the application's integrity and registers it on-chain to the Nova Registry.
+### The Development & Deployment Pipeline
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│                             NOVA STACK PIPELINE                                          │
+├──────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                          │
+│   1. DEVELOP              2. BUILD               3. DEPLOY             4. REGISTER      │
+│   ──────────              ────────               ────────              ────────────      │
+│   ┌────────────┐          ┌────────────┐         ┌────────────┐        ┌────────────┐   │
+│   │  Enclaver  │  ──────▶ │  App Hub   │ ──────▶ │  Enclaver  │ ─────▶ │  ZKP CLI   │   │
+│   │            │          │            │         │            │        │            │   │
+│   │ Build &    │          │ Transparent│         │ Run your   │        │ Attest,    │   │
+│   │ test your  │          │ CI/CD build│         │ EIF on AWS │        │ Prove &    │   │
+│   │ TEE app    │          │ with proofs│         │ Nitro      │        │ Register   │   │
+│   └────────────┘          └────────────┘         └────────────┘        └─────┬──────┘   │
+│                                                                              │          │
+│                                                                              ▼          │
+│                                                                        ┌────────────┐   │
+│                                                                        │App Registry│   │
+│                                                                        │ (On-Chain) │   │
+│                                                                        └────────────┘   │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+1. **Develop**: Use **Enclaver** to build and test your TEE application locally in mock mode or on a real Nitro Enclave.
+2. **Build**: Use **App Hub** (or your own CI/CD) to transparently build your application, producing a verifiable EIF and measurement (PCR0).
+3. **Deploy**: Use **Enclaver** to run the built EIF on your own AWS EC2 instances with Nitro Enclave support.
+4. **Register**: Use **ZKP CLI** to obtain remote attestation from your running enclave, generate a Zero-Knowledge Proof, and register your app on-chain in the **App Registry**.
+
+Learn more about this workflow at [https://sparsity.cloud/how-it-works](https://sparsity.cloud/how-it-works).
+
+---
+
+## Getting Started
+
+### 1. Clone the Repository
+
+To get started with Nova Stack, clone the repository:
+
+```bash
+git clone https://github.com/sparsity-xyz/nova-stack.git
+cd nova-stack
+```
 
 ---
 
 ## Core Components
 
 ### 1. Enclaver
-**The Engine**  
+**The Development & Runtime Engine**  
 [./enclaver/](./enclaver/)  
 *Original Repo: [https://github.com/sparsity-xyz/enclaver/](https://github.com/sparsity-xyz/enclaver/)*
 
-Enclaver is the core toolkit that simplifies packaging and running applications inside AWS Nitro Enclaves. It builds a docker image into an Enclave Image File (EIF) and provides a runtime supervisor called **Odyn** that runs inside the enclave.
+Enclaver is the core toolkit for the entire lifecycle of AWS Nitro Enclave applications - from development to production. It builds a Docker image into an Enclave Image File (EIF), runs the enclave, and provides a runtime supervisor called **Odyn** that manages your application inside the enclave.
 
 #### Key Features
 
-*   **Networking & Proxies**: NITRO Enclaves have no native networking. Enclaver provides transparent Ingress (TCP) and Egress (HTTP) proxies so your app can communicate with the outside world using standard protocols.
+*   **Networking & Proxies**: Nitro Enclaves have no native networking. Enclaver provides transparent Ingress (TCP) and Egress (HTTP) proxies so your app can communicate with the outside world using standard protocols.
 *   **Odyn Supervisor**: The PID 1 process inside the enclave. It manages your application lifecycle, proxies, and provides an internal API for security primitives.
 *   **Trustless RPC (Helios)**: Includes a built-in **Helios Light Client** that syncs with Ethereum/OP Stack chains. Your app gets a local, trustless JSON-RPC endpoint (`http://localhost:8545`) verified by cryptographic proofs, eliminating reliance on trusted 3rd party RPCs.
 *   **Persistent Storage (S3)**: An encrypted, isolated storage layer backed by AWS S3. The enclave uses its unique identity to read/write data securely, allowing stateful apps to run in a stateless enclave environment.
@@ -36,60 +76,90 @@ Enclaver is the core toolkit that simplifies packaging and running applications 
     *   **Encryption**: ECIES (ECDH + AES-GCM) for secure communication with clients.
     *   **Randomness**: Hardware-based true random number generation from the NSM.
 
-### 2. Nova App Hub
+### 2. App Hub
 **The Transparent Builder**  
 [./app-hub/](./app-hub/)  
 *Original Repo: [https://github.com/sparsity-xyz/sparsity-nova-app-hub](https://github.com/sparsity-xyz/sparsity-nova-app-hub)*
 
-A centralized, transparent build platform. Applications submitted here are built publicly using GitHub Actions. This ensures that the binary running in the enclave matches the source code, creating a "chain of custody" for the software supply chain.
-- **SLSA Level 3**: Builds are signed and verifiable.
-- **PCR Generation**: Automatically calculates the measurements needed for remote attestation.
+A transparent build system using GitHub Actions. Applications submitted here are built publicly, ensuring that the binary running in the enclave matches the source code. This creates a "chain of custody" for the software supply chain.
 
-### 3. Nova Examples
-**The Reference**  
-[./nova-examples/](./nova-examples/)  
-*Original Repo: [https://github.com/sparsity-xyz/sparsity-nova-examples](https://github.com/sparsity-xyz/sparsity-nova-examples)*
+*   **SLSA Level 3**: Builds are signed and verifiable.
+*   **PCR Generation**: Automatically calculates the measurements needed for remote attestation.
+*   **Build Attestation**: Creates cryptographic proofs tying source code commits to built EIF artifacts.
 
-A collection of reference applications demonstrating how to use the Nova Stack. Includes examples for:
-- Secure Chat Bots (End-to-end encryption)
-- Oracles (Data fetching and signing)
-- Key Management
+> 💡 **Note**: You can also set up your own build pipeline using the same GitHub Actions workflows provided in App Hub.
 
-### 4. Nova App Template
-**The Starter**  
-[./nova-app-template/](./nova-app-template/)  
-*Original Repo: [https://github.com/sparsity-xyz/nova-app-template](https://github.com/sparsity-xyz/nova-app-template)*
+### 3. App Registry
+**The On-Chain Registry**  
+[./app-registry/](./app-registry/)  
+*Original Repo: [https://github.com/sparsity-xyz/nova-contracts](https://github.com/sparsity-xyz/nova-contracts)*
 
-The standard boilerplate for creating new Nova applications. It comes pre-configured with:
-- **FastAPI / Python** backend structure.
-- **Enclaver** configuration (`enclaver.yaml`).
-- **Helios** light client integration for trustless blockchain access.
-- **Frontend** templates.
+Smart contracts for on-chain TEE application registration and verification. Deploy your own instance of the registry or use an existing deployment.
 
-### 5. Sparsity Nova Platform
-**The Cloud**  
-[https://sparsity.cloud](https://sparsity.cloud)
+#### Key Features
 
-The management platform that orchestrates the infrastructure. It connects the dots by currently running the infrastructure that interacts with the Enclaver runtime and the on-chain Registry.
-- **Automated Deployment**: One-click deploy to AWS Nitro Enclaves.
-- **ZKP Verification**: Automatically generates SP1 proofs of attestation.
-- **On-Chain Registry**: Registers verified applications on the Base Sepolia network.
+*   **SparsityAppRegistry**: The main registry contract for registering TEE applications.
+*   **NitroEnclaveVerifier**: Verifies ZK proofs of AWS Nitro attestations on-chain.
+*   **SP1 Proof Verification**: Uses Succinct's SP1 ZK proof system for succinct verification.
+*   **Flexible Registration**: Supports both ZKP-verified and unverified app registration modes.
+
+### 4. ZKP CLI
+**The Attestation & Registration Tool**  
+[./zkp-cli/](./zkp-cli/)
+
+> ⚠️ **Under Development**
+
+A command-line tool for the final step of the deployment pipeline. It connects to proving services to:
+
+*   **Retrieve Remote Attestations**: Connect to a running enclave and obtain attestation from the AWS Nitro Secure Module (NSM).
+*   **Generate ZK Proofs**: Submit the attestation to an SP1 proving service to generate a Zero-Knowledge Proof of the enclave's identity.
+*   **On-Chain Registration**: Submit the ZK proof to the App Registry smart contract, completing the verifiable registration.
 
 ---
 
-## Developer Workflow
+## Quick Start
 
-To build a secure application on Nova:
+### Step 1: Develop Your Application
 
-1.  **Clone the Template**: Start with `nova-app-template`.
-    ```bash
-    git clone https://github.com/sparsity-xyz/nova-app-template my-app
-    ```
-2.  **Develop Locally**: Use `enclaver` (or the mock mode in the template) to iterate on your logic.
-3.  **Publish**: Submit your application configuration to the **Nova App Hub**.
-4.  **Deploy**: Use the **Nova Platform** console to launch your application. The platform will verify your build from the App Hub and launch it into a secure enclave.
+1.  Check the [Sparsity Nova Examples](https://github.com/sparsity-xyz/sparsity-nova-examples) for reference implementations.
+2.  Use **Enclaver** to build and test your application locally:
+
+
+### Step 2: Build Transparently
+
+1.  Submit your application to **App Hub** for transparent, verifiable builds.
+2.  GitHub Actions will build your EIF and generate PCR measurements.
+3.  Download the built artifacts (EIF + attestation).
+
+### Step 3: Deploy to AWS
+
+1.  Launch an EC2 instance with Nitro Enclave support in your own AWS account.
+2.  Deploy the built EIF using the Enclaver runtime.
+3.  Your enclave is now running and accessible.
+
+### Step 4: Register On-Chain
+
+1.  Deploy your own App Registry (or use an existing deployment):
+2.  Use **ZKP CLI** to attest, prove, and register your running enclave:
+
+---
+
+## Why Nova Stack?
+
+| Feature | Benefit |
+|---------|---------|
+| **Fully Open Source** | Inspect, modify, and self-host every component |
+| **No Vendor Lock-in** | Deploy to your own AWS account, use your own infrastructure |
+| **Verifiable Builds** | Transparent CI/CD ensures binary integrity |
+| **On-Chain Registration** | Cryptographic proof of your enclave's identity on the blockchain |
+| **Self-Contained** | Complete pipeline from development to on-chain registration |
+
+---
 
 ## Resources
 
-- [Sparsity Cloud Website](https://sparsity.cloud)
-- [Enclaver Documentation](https://github.com/sparsity-xyz/enclaver/tree/sparsity/docs)
+- [How It Works](https://sparsity.cloud/how-it-works)
+- [Enclaver Documentation](./enclaver/docs/)
+- [App Registry Documentation](./app-registry/README.md)
+- [Nova Examples](https://github.com/sparsity-xyz/sparsity-nova-examples)
+- [Sparsity Cloud](https://sparsity.cloud) - Optional managed platform for simplified deployment

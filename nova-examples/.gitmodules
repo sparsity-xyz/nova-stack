@@ -1,6 +1,0 @@
-[submodule "price-oracle/contracts/lib/forge-std"]
-	path = price-oracle/contracts/lib/forge-std
-	url = https://github.com/foundry-rs/forge-std
-[submodule "nova-app-template/contracts/lib/forge-std"]
-	path = nova-app-template/contracts/lib/forge-std
-	url = https://github.com/foundry-rs/forge-std
