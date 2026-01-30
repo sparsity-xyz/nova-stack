@@ -89,6 +89,12 @@ Smart contracts for on-chain TEE application registration and verification. Depl
 *   **SP1 Proof Verification**: Uses Succinct's SP1 ZK proof system for succinct verification.
 *   **Flexible Registration**: Supports both ZKP-verified and unverified app registration modes.
 
+Planned features:
+
+*  Upgradable registry
+*  Alignment with ERC-733
+*  Application lifecycle management
+
 ### 4. ZKP CLI
 **The Attestation & Registration Tool**  
 [./zkp-cli/](./zkp-cli/)
