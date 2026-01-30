@@ -141,7 +141,6 @@ A command-line tool for the final step of the deployment pipeline. It connects t
 | Feature | Benefit |
 |---------|---------|
 | **Fully Open Source** | Inspect, modify, and self-host every component |
-| **No Vendor Lock-in** | Deploy to your own AWS account, use your own infrastructure |
 | **Verifiable Builds** | Transparent CI/CD ensures binary integrity |
 | **On-Chain Registration** | Cryptographic proof of your enclave's identity on the blockchain |
 | **Self-Contained** | Complete pipeline from development to on-chain registration |
