@@ -156,4 +156,4 @@ A command-line tool for the final step of the deployment pipeline. It connects t
 - [Nova App Examples](https://github.com/sparsity-xyz/sparsity-nova-examples)
 - [Enclaver Documentation](./enclaver/docs/)
 - [App Registry Documentation](./app-registry/README.md)
-- [Sparsity Cloud](https://sparsity.cloud) - Optional managed platform for simplified deployment
+- [Managed Nova Stack](https://sparsity.cloud) - Optional managed platform for simplified deployment
