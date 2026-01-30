@@ -23,13 +23,13 @@ Nova Stack consists of four core components that together provide a complete, en
 │   │ Build &    │          │ Transparent│         │ Run your   │        │ Attest,    │    │
 │   │ test your  │          │ CI/CD build│         │ EIF on AWS │        │ Prove &    │    │
 │   │ TEE app    │          │ with proofs│         │ Nitro      │        │ Register   │    │
-│   └────────────┘          └────────────┘         └────────────┘        └─────┬──────┘    │
-│                                                                              │           │
-│                                                                              ▼           │
-│                                                                        ┌────────────┐    │
-│                                                                        │App Registry│    │
-│                                                                        │ (On-Chain) │    │
-│                                                                        └────────────┘    │
+│   └────────────┘          └─────┬──────┘         └────────────┘        └─────┬──────┘    │
+│                                 │ Upload hash                                │ Verify &  │
+│                                 ▼    (WIP)                                   ▼ Register  │
+│                           ┌─────────────────────────────────────────────────────────┐    │
+│                           │                       App Registry                      │    │
+│                           │                        (On-Chain)                       │    │
+│                           └─────────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
