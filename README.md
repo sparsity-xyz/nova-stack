@@ -1,6 +1,6 @@
 # Nova Stack
 
-The **Nova Stack** is a comprehensive, self-contained suite of open-source tools for building, deploying, and verifying Trusted Execution Environment (TEE) applications on AWS Nitro Enclaves.
+The **Nova Stack** is a comprehensive, self-contained suite of open-source tools for building, deploying, and verifying Trusted Execution Environment (TEE) applications on blockchain and AWS Nitro Enclaves.
 
 With Nova Stack, you can independently develop, build, deploy, and register TEE applications **without relying on any managed platform**. You own and control the entire pipeline.
 
