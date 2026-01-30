@@ -44,6 +44,8 @@ Learn more about this workflow at [https://sparsity.cloud/how-it-works](https://
 
 ## Core Components
 
+Note that this repo contains the latest released version of the components, while they are being actively developed in the original repos.
+
 ### 1. Enclaver
 **The Development & Runtime Engine**  
 [./enclaver/](./enclaver/)  
