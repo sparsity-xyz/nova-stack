@@ -82,20 +82,19 @@ A transparent build system using GitHub Actions. Applications submitted here are
 **The On-Chain Registry**  
 [./app-registry/](./app-registry/)  
 
-Smart contracts for on-chain TEE application registration and verification. Deploy your own instance of the registry or use an existing deployment.
+Smart contracts for on-chain TEE application registration and verification.
+
+> 🔗 **Live Deployment**: [Base Sepolia (0x0f68...4cc8)](https://sepolia.basescan.org/address/0x0f68E6e699f2E972998a1EcC000c7ce103E64cc8)
 
 #### Key Features
 
-*   **SparsityAppRegistry**: The main registry contract for registering TEE applications.
-*   **NitroEnclaveVerifier**: Verifies ZK proofs of AWS Nitro attestations on-chain.
-*   **SP1 Proof Verification**: Uses Succinct's SP1 ZK proof system for succinct verification.
-*   **Flexible Registration**: Supports both ZKP-verified and unverified app registration modes.
-
-Planned features:
-
-*  Upgradable registry
-*  Alignment with ERC-733
-*  Application lifecycle management
+*   **NovaAppRegistry**: The core registry managing the 3-layer hierarchy of TEE applications:
+    *   **App**: Identity and ownership.
+    *   **Version**: Immutable code measurements (PCRs) and metadata.
+    *   **Instance**: Live running enclaves verified via ZK proofs.
+*   **NitroEnclaveVerifier**: Verifies ZK proofs of AWS Nitro attestations on-chain using SP1.
+*   **Access Control**: Granular permissions for App Owners, Instance Operators, and the Registry Admin.
+*   **Upgradeable**: Built using the UUPS proxy pattern for future extensibility.
 
 ### 4. ZKP CLI
 **The Attestation & Registration Tool**  
