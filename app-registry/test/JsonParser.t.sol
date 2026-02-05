@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-pragma solidity ^0.8.30;
+pragma solidity ^0.8.33;
 
-import "forge-std/Test.sol";
-import "../src/libraries/JsonParser.sol";
+import {Test} from "forge-std/Test.sol";
+import {JsonParser} from "../src/libraries/JsonParser.sol";
 
 contract JsonParserTest is Test {
     // External wrapper function to allow expectRevert to work
