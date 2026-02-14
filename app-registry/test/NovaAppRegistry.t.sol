@@ -5,8 +5,56 @@ import {Test} from "forge-std/Test.sol";
 import {NovaAppRegistry} from "../src/NovaAppRegistry.sol";
 import {INovaAppInterface} from "../src/interfaces/INovaAppInterface.sol";
 import {
+    ZkCoProcessorType,
+    VerifierJournal,
+    VerificationResult,
+    Pcr,
+    Bytes48
+} from "../src/interfaces/INitroEnclaveVerifier.sol";
+import {
     ERC1967Proxy
 } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {LegacyNovaAppRegistryV0} from "./mocks/LegacyNovaAppRegistryV0.sol";
+
+contract MockNitroEnclaveVerifier {
+    function verify(
+        bytes calldata output,
+        ZkCoProcessorType,
+        bytes calldata
+    ) external pure returns (VerifierJournal memory) {
+        (
+            bytes32[3] memory pcrFirst,
+            bytes16[3] memory pcrSecond,
+            bytes memory userData,
+            bytes memory publicKey,
+            VerificationResult result
+        ) = abi.decode(
+                output,
+                (bytes32[3], bytes16[3], bytes, bytes, VerificationResult)
+            );
+
+        Pcr[] memory pcrs = new Pcr[](3);
+        for (uint64 i = 0; i < 3; i++) {
+            pcrs[i] = Pcr({
+                index: i,
+                value: Bytes48({first: pcrFirst[i], second: pcrSecond[i]})
+            });
+        }
+
+        return
+            VerifierJournal({
+                result: result,
+                trustedCertsPrefixLen: 0,
+                timestamp: 0,
+                certs: new bytes32[](0),
+                userData: userData,
+                nonce: "",
+                publicKey: publicKey,
+                pcrs: pcrs,
+                moduleId: ""
+            });
+    }
+}
 
 contract MockNovaApp is INovaAppInterface {
     address public override novaAppRegistry;
@@ -135,15 +183,17 @@ contract NovaAppRegistryTest is Test {
     NovaAppRegistry private registry;
     MockNovaApp private mockDapp;
     GasGuzzlerNovaApp private gasGuzzler;
+    MockNitroEnclaveVerifier private mockVerifier;
 
     address private alice = address(0xA11CE);
     address private bob = address(0xB0B);
 
     function setUp() public {
+        mockVerifier = new MockNitroEnclaveVerifier();
         NovaAppRegistry impl = new NovaAppRegistry();
         ERC1967Proxy proxy = new ERC1967Proxy(
             address(impl),
-            abi.encodeCall(NovaAppRegistry.initialize, (address(0x1234)))
+            abi.encodeCall(NovaAppRegistry.initialize, (address(mockVerifier)))
         );
         registry = NovaAppRegistry(address(proxy));
         mockDapp = new MockNovaApp();
@@ -153,6 +203,66 @@ contract NovaAppRegistryTest is Test {
     function _mkPcr(uint8 firstByte) private pure returns (bytes memory out) {
         out = new bytes(48);
         out[0] = bytes1(firstByte);
+    }
+
+    function _addressToHex(address a) private pure returns (string memory) {
+        bytes memory chars = "0123456789abcdef";
+        bytes memory out = new bytes(42);
+        out[0] = "0";
+        out[1] = "x";
+        uint160 value = uint160(a);
+        for (uint256 i = 0; i < 20; i++) {
+            // forge-lint: disable-next-line(unsafe-typecast)
+            uint8 b = uint8(value >> (8 * (19 - i)));
+            out[2 + i * 2] = chars[b >> 4];
+            out[3 + i * 2] = chars[b & 0x0f];
+        }
+        return string(out);
+    }
+
+    function _registerInstanceWithMockProof(
+        uint256 appId,
+        uint256 versionId,
+        string memory instanceUrl,
+        bytes memory teePubkey,
+        address teeWallet,
+        bytes32 codeMeasurement
+    ) private returns (uint256) {
+        bytes memory pcr0 = _mkPcr(1);
+        bytes memory pcr1 = _mkPcr(2);
+        bytes memory pcr2 = _mkPcr(3);
+        assertEq(
+            keccak256(abi.encodePacked(pcr0, pcr1, pcr2)),
+            codeMeasurement
+        );
+
+        bytes32[3] memory pcrFirst = [
+            bytes32(bytes1(uint8(1))),
+            bytes32(bytes1(uint8(2))),
+            bytes32(bytes1(uint8(3)))
+        ];
+        bytes16[3] memory pcrSecond;
+        bytes memory userData = bytes(
+            string.concat('{"eth_addr":"', _addressToHex(teeWallet), '"}')
+        );
+
+        bytes memory publicValues = abi.encode(
+            pcrFirst,
+            pcrSecond,
+            userData,
+            teePubkey,
+            VerificationResult.Success
+        );
+
+        return
+            registry.registerInstance(
+                appId,
+                versionId,
+                instanceUrl,
+                ZkCoProcessorType.RiscZero,
+                publicValues,
+                hex""
+            );
     }
 
     function test_enrollVersion_revertsOnInvalidPcrLengths() public {
@@ -229,9 +339,7 @@ contract NovaAppRegistryTest is Test {
         );
     }
 
-    function test_registerInstanceWithoutProof_bindsWalletAndCallsDapp()
-        public
-    {
+    function test_registerInstance_bindsWalletAndCallsDapp() public {
         vm.prank(alice);
         uint256 appId = registry.createApp(
             NITRO_ARCH,
@@ -270,11 +378,11 @@ contract NovaAppRegistryTest is Test {
             versionId,
             teeWallet,
             "http://1.2.3.4:8000",
-            false
+            true
         );
 
         vm.prank(alice);
-        uint256 instanceId = registry.registerInstanceWithoutProof(
+        uint256 instanceId = _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://1.2.3.4:8000",
@@ -302,9 +410,7 @@ contract NovaAppRegistryTest is Test {
         assertEq(mockDapp.lastInstanceId(), instanceId);
     }
 
-    function test_registerInstanceWithoutProof_revertsOnDuplicateWallet()
-        public
-    {
+    function test_registerInstance_revertsOnDuplicateWallet() public {
         vm.prank(alice);
         uint256 appId = registry.createApp(
             NITRO_ARCH,
@@ -334,7 +440,7 @@ contract NovaAppRegistryTest is Test {
         address teeWallet = address(0x1234567890AbcdEF1234567890aBcdef12345678);
 
         vm.prank(alice);
-        registry.registerInstanceWithoutProof(
+        _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://a",
@@ -345,7 +451,7 @@ contract NovaAppRegistryTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(NovaAppRegistry.DuplicateTEEWallet.selector);
-        registry.registerInstanceWithoutProof(
+        _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://b",
@@ -355,7 +461,7 @@ contract NovaAppRegistryTest is Test {
         );
     }
 
-    function test_registerInstanceWithoutProof_revertsOnBadUrlScheme() public {
+    function test_registerInstance_revertsOnBadUrlScheme() public {
         vm.prank(alice);
         uint256 appId = registry.createApp(
             NITRO_ARCH,
@@ -386,7 +492,7 @@ contract NovaAppRegistryTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(NovaAppRegistry.InvalidInstanceUrl.selector);
-        registry.registerInstanceWithoutProof(
+        _registerInstanceWithMockProof(
             appId,
             versionId,
             "ftp://1.2.3.4",
@@ -396,9 +502,7 @@ contract NovaAppRegistryTest is Test {
         );
     }
 
-    function test_registerInstanceWithoutProof_allowsHttpSchemeCaseInsensitive()
-        public
-    {
+    function test_registerInstance_allowsHttpSchemeCaseInsensitive() public {
         vm.prank(alice);
         uint256 appId = registry.createApp(
             NITRO_ARCH,
@@ -428,7 +532,7 @@ contract NovaAppRegistryTest is Test {
         address teeWallet = address(0x1234567890AbcdEF1234567890aBcdef12345678);
 
         vm.prank(alice);
-        uint256 instanceId = registry.registerInstanceWithoutProof(
+        uint256 instanceId = _registerInstanceWithMockProof(
             appId,
             versionId,
             "HTTP://EXAMPLE",
@@ -471,7 +575,7 @@ contract NovaAppRegistryTest is Test {
         address teeWallet = address(0x1234567890AbcdEF1234567890aBcdef12345678);
 
         vm.prank(alice);
-        uint256 instanceId = registry.registerInstanceWithoutProof(
+        uint256 instanceId = _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://ok",
@@ -538,7 +642,7 @@ contract NovaAppRegistryTest is Test {
         );
 
         vm.prank(alice);
-        uint256 instanceId = registry.registerInstanceWithoutProof(
+        uint256 instanceId = _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://ok",
@@ -588,7 +692,7 @@ contract NovaAppRegistryTest is Test {
         );
 
         vm.prank(alice);
-        uint256 instanceId = registry.registerInstanceWithoutProof(
+        uint256 instanceId = _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://ok",
@@ -639,7 +743,7 @@ contract NovaAppRegistryTest is Test {
 
         // addOperator will also OOG, but ignore it for this test.
         vm.prank(alice);
-        uint256 instanceId = registry.registerInstanceWithoutProof(
+        uint256 instanceId = _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://ok",
@@ -748,9 +852,7 @@ contract NovaAppRegistryTest is Test {
         assertEq(uint8(v.status), uint8(NovaAppRegistry.VersionStatus.REVOKED));
     }
 
-    function test_registerInstanceWithoutProof_allowsDeprecatedVersion()
-        public
-    {
+    function test_registerInstance_revertsOnDeprecatedVersion() public {
         vm.prank(alice);
         uint256 appId = registry.createApp(
             NITRO_ARCH,
@@ -779,10 +881,10 @@ contract NovaAppRegistryTest is Test {
         registry.deprecateVersion(appId, versionId);
 
         bytes32 codeMeasurement = keccak256(abi.encodePacked(pcr0, pcr1, pcr2));
-        uint256 instanceId;
 
         vm.prank(alice);
-        instanceId = registry.registerInstanceWithoutProof(
+        vm.expectRevert(NovaAppRegistry.VersionNotEnrolled.selector);
+        _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://deprecated-ok",
@@ -790,12 +892,6 @@ contract NovaAppRegistryTest is Test {
             address(0x2222222222222222222222222222222222222222),
             codeMeasurement
         );
-
-        assertEq(instanceId, 1);
-        NovaAppRegistry.RuntimeInstance memory instance = registry.getInstance(
-            instanceId
-        );
-        assertEq(instance.versionId, versionId);
     }
 
     function test_multipleInstancesPerVersion_getInstancesForVersion_returnsAll()
@@ -828,7 +924,7 @@ contract NovaAppRegistryTest is Test {
         bytes32 codeMeasurement = keccak256(abi.encodePacked(pcr0, pcr1, pcr2));
 
         vm.prank(alice);
-        uint256 i1 = registry.registerInstanceWithoutProof(
+        uint256 i1 = _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://one",
@@ -837,7 +933,7 @@ contract NovaAppRegistryTest is Test {
             codeMeasurement
         );
         vm.prank(alice);
-        uint256 i2 = registry.registerInstanceWithoutProof(
+        uint256 i2 = _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://two",
@@ -875,9 +971,7 @@ contract NovaAppRegistryTest is Test {
         registry.setCallbackGasLimit(123456);
     }
 
-    function test_registerInstanceWithoutProof_revertsOnRevokedVersion()
-        public
-    {
+    function test_registerInstance_revertsOnRevokedVersion() public {
         vm.prank(alice);
         uint256 appId = registry.createApp(
             NITRO_ARCH,
@@ -909,7 +1003,7 @@ contract NovaAppRegistryTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(NovaAppRegistry.VersionRevoked.selector);
-        registry.registerInstanceWithoutProof(
+        _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://ok",
@@ -919,9 +1013,7 @@ contract NovaAppRegistryTest is Test {
         );
     }
 
-    function test_registerInstanceWithoutProof_requiresOwnerOrRegistryOwner()
-        public
-    {
+    function test_registerInstance_revertsForNonOwner() public {
         vm.prank(alice);
         uint256 appId = registry.createApp(
             NITRO_ARCH,
@@ -950,13 +1042,130 @@ contract NovaAppRegistryTest is Test {
 
         vm.prank(bob);
         vm.expectRevert(NovaAppRegistry.NotAppOwner.selector);
-        registry.registerInstanceWithoutProof(
+        _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://ok",
             hex"112233",
             address(0x1234567890AbcdEF1234567890aBcdef12345678),
             codeMeasurement
+        );
+    }
+
+    function test_activeInstances_addsOnRegister_removesOnStopped() public {
+        vm.prank(alice);
+        uint256 appId = registry.createApp(
+            NITRO_ARCH,
+            address(mockDapp),
+            "ipfs://meta"
+        );
+
+        bytes memory pcr0 = _mkPcr(1);
+        bytes memory pcr1 = _mkPcr(2);
+        bytes memory pcr2 = _mkPcr(3);
+
+        vm.prank(alice);
+        uint256 versionId = registry.enrollVersion(
+            appId,
+            "1.0.0",
+            pcr0,
+            pcr1,
+            pcr2,
+            "img",
+            "audit",
+            "hash",
+            "run"
+        );
+
+        bytes32 codeMeasurement = keccak256(abi.encodePacked(pcr0, pcr1, pcr2));
+        address w1 = address(0x1111111111111111111111111111111111111111);
+        address w2 = address(0x2222222222222222222222222222222222222222);
+
+        vm.prank(alice);
+        uint256 i1 = _registerInstanceWithMockProof(
+            appId,
+            versionId,
+            "http://one",
+            hex"112233",
+            w1,
+            codeMeasurement
+        );
+
+        vm.prank(alice);
+        _registerInstanceWithMockProof(
+            appId,
+            versionId,
+            "http://two",
+            hex"445566",
+            w2,
+            codeMeasurement
+        );
+
+        address[] memory active = registry.getActiveInstances(appId);
+        assertEq(active.length, 2);
+
+        vm.prank(alice);
+        registry.updateInstanceStatus(
+            i1,
+            NovaAppRegistry.InstanceStatus.STOPPED
+        );
+
+        active = registry.getActiveInstances(appId);
+        assertEq(active.length, 1);
+        assertEq(active[0], w2);
+    }
+
+    function test_revokeVersion_removesInstancesFromActiveList() public {
+        vm.prank(alice);
+        uint256 appId = registry.createApp(
+            NITRO_ARCH,
+            address(mockDapp),
+            "ipfs://meta"
+        );
+
+        bytes memory pcr0 = _mkPcr(1);
+        bytes memory pcr1 = _mkPcr(2);
+        bytes memory pcr2 = _mkPcr(3);
+
+        vm.prank(alice);
+        uint256 versionId = registry.enrollVersion(
+            appId,
+            "1.0.0",
+            pcr0,
+            pcr1,
+            pcr2,
+            "img",
+            "audit",
+            "hash",
+            "run"
+        );
+
+        bytes32 codeMeasurement = keccak256(abi.encodePacked(pcr0, pcr1, pcr2));
+        address wallet = address(0x1234567890AbcdEF1234567890aBcdef12345678);
+
+        vm.prank(alice);
+        uint256 instanceId = _registerInstanceWithMockProof(
+            appId,
+            versionId,
+            "http://active",
+            hex"112233",
+            wallet,
+            codeMeasurement
+        );
+
+        vm.prank(alice);
+        registry.revokeVersion(appId, versionId);
+
+        address[] memory active = registry.getActiveInstances(appId);
+        assertEq(active.length, 0);
+
+        // Status should still be ACTIVE
+        NovaAppRegistry.RuntimeInstance memory instance = registry.getInstance(
+            instanceId
+        );
+        assertEq(
+            uint8(instance.status),
+            uint8(NovaAppRegistry.InstanceStatus.ACTIVE)
         );
     }
 
@@ -982,7 +1191,7 @@ contract NovaAppRegistryTest is Test {
         uint256 appId = registry.createApp(
             NITRO_ARCH,
             address(mockDapp),
-            "meta"
+            "ipfs://meta"
         );
         vm.prank(alice);
         uint256 versionId = registry.enrollVersion(
@@ -1001,7 +1210,7 @@ contract NovaAppRegistryTest is Test {
             abi.encodePacked(_mkPcr(1), _mkPcr(2), _mkPcr(3))
         );
         vm.prank(alice);
-        uint256 instanceId = registry.registerInstanceWithoutProof(
+        uint256 instanceId = _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://url",
@@ -1024,7 +1233,7 @@ contract NovaAppRegistryTest is Test {
         uint256 appId = registry.createApp(
             NITRO_ARCH,
             address(mockDapp),
-            "meta"
+            "ipfs://meta"
         );
         vm.prank(alice);
         uint256 versionId = registry.enrollVersion(
@@ -1050,7 +1259,7 @@ contract NovaAppRegistryTest is Test {
         uint256 appId = registry.createApp(
             NITRO_ARCH,
             address(mockDapp),
-            "meta"
+            "ipfs://meta"
         );
         vm.prank(alice);
         uint256 versionId = registry.enrollVersion(
@@ -1076,7 +1285,7 @@ contract NovaAppRegistryTest is Test {
         uint256 appId = registry.createApp(
             NITRO_ARCH,
             address(mockDapp),
-            "meta"
+            "ipfs://meta"
         );
 
         // Empty version name -> revert
@@ -1113,7 +1322,122 @@ contract NovaAppRegistryTest is Test {
     function test_createApp_revertsOnInvalidMetadata() public {
         vm.prank(alice);
         vm.expectRevert(NovaAppRegistry.InvalidMetadataUri.selector);
-        registry.createApp(NITRO_ARCH, address(mockDapp), "");
+        registry.createApp(NITRO_ARCH, address(mockDapp), "invalid");
+    }
+
+    function test_createApp_allowsEmptyMetadata() public {
+        vm.prank(alice);
+        uint256 appId = registry.createApp(NITRO_ARCH, address(mockDapp), "");
+        assertEq(registry.getApp(appId).metadataUri, "");
+    }
+
+    function test_createApp_allowsHttpsMetadata_caseInsensitive() public {
+        vm.prank(alice);
+        uint256 appId1 = registry.createApp(
+            NITRO_ARCH,
+            address(mockDapp),
+            "https://example.com"
+        );
+        assertEq(registry.getApp(appId1).metadataUri, "https://example.com");
+
+        vm.prank(alice);
+        uint256 appId2 = registry.createApp(
+            NITRO_ARCH,
+            address(mockDapp),
+            "HTTPS://EXAMPLE.COM"
+        );
+        assertEq(registry.getApp(appId2).metadataUri, "HTTPS://EXAMPLE.COM");
+
+        vm.prank(alice);
+        uint256 appId3 = registry.createApp(
+            NITRO_ARCH,
+            address(mockDapp),
+            "HttPs://Example.Com"
+        );
+        assertEq(registry.getApp(appId3).metadataUri, "HttPs://Example.Com");
+    }
+
+    function test_createApp_allowsIpfsMetadata_caseInsensitive() public {
+        vm.prank(alice);
+        uint256 appId1 = registry.createApp(
+            NITRO_ARCH,
+            address(mockDapp),
+            "ipfs://Qm123"
+        );
+        assertEq(registry.getApp(appId1).metadataUri, "ipfs://Qm123");
+
+        vm.prank(alice);
+        uint256 appId2 = registry.createApp(
+            NITRO_ARCH,
+            address(mockDapp),
+            "IPFS://Qm456"
+        );
+        assertEq(registry.getApp(appId2).metadataUri, "IPFS://Qm456");
+
+        vm.prank(alice);
+        uint256 appId3 = registry.createApp(
+            NITRO_ARCH,
+            address(mockDapp),
+            "IpFs://Qm789"
+        );
+        assertEq(registry.getApp(appId3).metadataUri, "IpFs://Qm789");
+    }
+
+    function test_createApp_revertsOnInvalidSchemes() public {
+        vm.startPrank(alice);
+
+        vm.expectRevert(NovaAppRegistry.InvalidMetadataUri.selector);
+        registry.createApp(NITRO_ARCH, address(mockDapp), "http://example.com");
+
+        vm.expectRevert(NovaAppRegistry.InvalidMetadataUri.selector);
+        registry.createApp(NITRO_ARCH, address(mockDapp), "ftp://example.com");
+
+        vm.expectRevert(NovaAppRegistry.InvalidMetadataUri.selector);
+        registry.createApp(NITRO_ARCH, address(mockDapp), "ipfs:/Qm123");
+
+        vm.expectRevert(NovaAppRegistry.InvalidMetadataUri.selector);
+        registry.createApp(NITRO_ARCH, address(mockDapp), "https//example.com");
+
+        vm.stopPrank();
+    }
+
+    function test_createApp_revertsOnWhitespace() public {
+        vm.startPrank(alice);
+
+        vm.expectRevert(NovaAppRegistry.InvalidMetadataUri.selector);
+        registry.createApp(
+            NITRO_ARCH,
+            address(mockDapp),
+            " https://example.com"
+        );
+
+        vm.expectRevert(NovaAppRegistry.InvalidMetadataUri.selector);
+        registry.createApp(
+            NITRO_ARCH,
+            address(mockDapp),
+            "https://example.com "
+        );
+
+        vm.expectRevert(NovaAppRegistry.InvalidMetadataUri.selector);
+        registry.createApp(
+            NITRO_ARCH,
+            address(mockDapp),
+            "h ttps://example.com"
+        );
+
+        vm.stopPrank();
+    }
+
+    function test_createApp_revertsOnShortUris() public {
+        vm.startPrank(alice);
+
+        vm.expectRevert(NovaAppRegistry.InvalidMetadataUri.selector);
+        registry.createApp(NITRO_ARCH, address(mockDapp), "https:/");
+
+        vm.expectRevert(NovaAppRegistry.InvalidMetadataUri.selector);
+        registry.createApp(NITRO_ARCH, address(mockDapp), "ipfs://"); // length 7, but only scheme
+
+        vm.stopPrank();
     }
 
     function test_registerInstance_revertsOnZeroAddressWallet() public {
@@ -1121,7 +1445,7 @@ contract NovaAppRegistryTest is Test {
         uint256 appId = registry.createApp(
             NITRO_ARCH,
             address(mockDapp),
-            "meta"
+            "ipfs://meta"
         );
         vm.prank(alice);
         uint256 versionId = registry.enrollVersion(
@@ -1141,7 +1465,7 @@ contract NovaAppRegistryTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(NovaAppRegistry.InvalidTEEWalletAddress.selector);
-        registry.registerInstanceWithoutProof(
+        _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://url",
@@ -1156,7 +1480,7 @@ contract NovaAppRegistryTest is Test {
         uint256 appId = registry.createApp(
             NITRO_ARCH,
             address(mockDapp),
-            "meta"
+            "ipfs://meta"
         );
         vm.prank(alice);
         uint256 versionId = registry.enrollVersion(
@@ -1175,7 +1499,7 @@ contract NovaAppRegistryTest is Test {
         );
 
         vm.prank(alice);
-        uint256 instanceId = registry.registerInstanceWithoutProof(
+        uint256 instanceId = _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://url",
@@ -1210,7 +1534,11 @@ contract NovaAppRegistryTest is Test {
 
     function test_updateAppStatus_permissions() public {
         vm.prank(alice);
-        uint256 appId = registry.createApp(NITRO_ARCH, address(0), "meta");
+        uint256 appId = registry.createApp(
+            NITRO_ARCH,
+            address(0),
+            "ipfs://meta"
+        );
 
         // App owner can toggle ACTIVE -> INACTIVE
         vm.prank(alice);
@@ -1256,7 +1584,11 @@ contract NovaAppRegistryTest is Test {
 
     function test_updateAppStatus_recoveryByRegistryOwner() public {
         vm.prank(alice);
-        uint256 appId = registry.createApp(NITRO_ARCH, address(0), "meta");
+        uint256 appId = registry.createApp(
+            NITRO_ARCH,
+            address(0),
+            "ipfs://meta"
+        );
 
         // Force REVOKED
         registry.updateAppStatus(appId, NovaAppRegistry.AppStatus.REVOKED);
@@ -1279,7 +1611,11 @@ contract NovaAppRegistryTest is Test {
 
     function test_statusEnforcement_enrollVersion() public {
         vm.prank(alice);
-        uint256 appId = registry.createApp(NITRO_ARCH, address(0), "meta");
+        uint256 appId = registry.createApp(
+            NITRO_ARCH,
+            address(0),
+            "ipfs://meta"
+        );
 
         vm.prank(alice);
         registry.updateAppStatus(appId, NovaAppRegistry.AppStatus.INACTIVE);
@@ -1301,7 +1637,11 @@ contract NovaAppRegistryTest is Test {
 
     function test_statusEnforcement_registerInstance() public {
         vm.prank(alice);
-        uint256 appId = registry.createApp(NITRO_ARCH, address(0), "meta");
+        uint256 appId = registry.createApp(
+            NITRO_ARCH,
+            address(0),
+            "ipfs://meta"
+        );
         vm.prank(alice);
         uint256 versionId = registry.enrollVersion(
             appId,
@@ -1320,7 +1660,7 @@ contract NovaAppRegistryTest is Test {
 
         vm.prank(alice);
         vm.expectRevert(NovaAppRegistry.AppNotActive.selector);
-        registry.registerInstanceWithoutProof(
+        _registerInstanceWithMockProof(
             appId,
             versionId,
             "http://a",
@@ -1328,6 +1668,37 @@ contract NovaAppRegistryTest is Test {
             ADDRESS1,
             keccak256(abi.encodePacked(_mkPcr(1), _mkPcr(2), _mkPcr(3)))
         );
+    }
+
+    function test_upgradeCompatibility_preservesLegacyStorageLayout() public {
+        LegacyNovaAppRegistryV0 legacyImpl = new LegacyNovaAppRegistryV0();
+        ERC1967Proxy proxy = new ERC1967Proxy(
+            address(legacyImpl),
+            abi.encodeCall(
+                LegacyNovaAppRegistryV0.initialize,
+                (address(mockVerifier))
+            )
+        );
+
+        LegacyNovaAppRegistryV0 legacy = LegacyNovaAppRegistryV0(
+            address(proxy)
+        );
+        assertEq(legacy.nextInstanceId(), 1);
+
+        // Old layout slot for nextInstanceId is 11.
+        vm.store(address(proxy), bytes32(uint256(11)), bytes32(uint256(7)));
+        assertEq(legacy.nextInstanceId(), 7);
+
+        NovaAppRegistry newImpl = new NovaAppRegistry();
+        legacy.upgradeToAndCall(address(newImpl), "");
+
+        NovaAppRegistry upgraded = NovaAppRegistry(address(proxy));
+        assertEq(upgraded.nextInstanceId(), 7);
+
+        // New storage starts after legacy fields and should be clean on first upgrade.
+        address[] memory active = upgraded.getActiveInstances(1);
+        assertEq(active.length, 0);
+        assertEq(upgraded.callbackGasLimit(), 100000);
     }
 
     address constant ADDRESS1 = address(0x1);

@@ -53,8 +53,11 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     // ========== Enums ==========
 
     enum VersionStatus {
+        // Normal state: can register new instances.
         ENROLLED,
+        // Deprecated state: cannot register new instances, existing instances keep their own status.
         DEPRECATED,
+        // Revoked state: cannot register new instances; consumers should treat existing instances as unusable.
         REVOKED
     }
 
@@ -154,6 +157,8 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     mapping(address => uint256) public walletToInstance;
     mapping(uint256 => mapping(uint256 => uint256[])) public versionInstances;
     uint256 public nextInstanceId;
+    mapping(uint256 => address[]) private _appActiveInstanceWallets; /// List of instances for non-revoked versions per appId
+    mapping(address => uint256) private _activeInstanceWalletIndexPlusOne;
 
     // ========== Events ==========
 
@@ -266,14 +271,14 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     /// @notice Creates a new application
     /// @param teeArch TEE architecture identifier (e.g., "nitro")
     /// @param dappContract Optional address of contract implementing INovaAppInterface
-    /// @param metadataUri URI to off-chain metadata
+    /// @param metadataUri URI to off-chain metadata (must be absolute https/ipfs or empty)
     /// @return appId The newly created app ID
     function createApp(
         bytes32 teeArch,
         address dappContract,
         string calldata metadataUri
     ) external returns (uint256 appId) {
-        if (bytes(metadataUri).length == 0) revert InvalidMetadataUri();
+        _validateMetadataUri(metadataUri);
         appId = nextAppId++;
 
         apps[appId] = App({
@@ -429,6 +434,18 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         if (version.versionId == 0) revert VersionNotFound();
 
         version.status = VersionStatus.REVOKED;
+
+        // Remove all instances of this version from the active list
+        uint256[] memory instanceIds = versionInstances[appId][versionId];
+        for (uint256 i = 0; i < instanceIds.length; i++) {
+            RuntimeInstanceStorage storage instance = _instances[
+                instanceIds[i]
+            ];
+            if (instance.teeWalletAddress != address(0)) {
+                _removeActiveInstanceWallet(instance.teeWalletAddress);
+            }
+        }
+
         emit VersionStatusChanged(appId, versionId, VersionStatus.REVOKED);
     }
 
@@ -452,16 +469,14 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     ) external returns (uint256 instanceId) {
         // Validate app status
         App storage app = apps[appId];
+        if (app.owner != msg.sender) revert NotAppOwner();
         if (app.status != AppStatus.ACTIVE) revert AppNotActive();
 
         // Validate version
         AppVersion storage version = appVersions[appId][versionId];
         if (version.versionId == 0) revert VersionNotFound();
         if (version.status == VersionStatus.REVOKED) revert VersionRevoked();
-        if (
-            version.status != VersionStatus.ENROLLED &&
-            version.status != VersionStatus.DEPRECATED
-        ) {
+        if (version.status != VersionStatus.ENROLLED) {
             revert VersionNotEnrolled();
         }
 
@@ -489,56 +504,6 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
             teePubkey,
             teeWalletAddress,
             true // zkVerified
-        );
-    }
-
-    /// @notice Registers an instance without ZK verification (for dev/trusted scenarios)
-    /// @param appId The application ID
-    /// @param versionId The version ID
-    /// @param instanceUrl The instance endpoint URL
-    /// @param teePubkey The TEE public key
-    /// @param teeWalletAddress The TEE wallet address
-    /// @param codeMeasurement The code measurement (must match enrolled version)
-    /// @return instanceId The newly registered instance ID
-    function registerInstanceWithoutProof(
-        uint256 appId,
-        uint256 versionId,
-        string calldata instanceUrl,
-        bytes calldata teePubkey,
-        address teeWalletAddress,
-        bytes32 codeMeasurement
-    ) external returns (uint256 instanceId) {
-        App storage app = apps[appId];
-        if (app.owner == address(0)) revert AppNotFound();
-        // Only app owner or registry owner can register without proof
-        if (app.owner != msg.sender && msg.sender != owner())
-            revert NotAppOwner();
-        if (app.status != AppStatus.ACTIVE) revert AppNotActive();
-
-        // Validate version
-        AppVersion storage version = appVersions[appId][versionId];
-        if (version.versionId == 0) revert VersionNotFound();
-        if (version.status == VersionStatus.REVOKED) revert VersionRevoked();
-
-        // Validate code measurement matches
-        if (codeMeasurement != version.codeMeasurement) {
-            revert CodeMeasurementMismatch();
-        }
-
-        // Input validation
-        if (teeWalletAddress == address(0)) revert InvalidTEEWalletAddress();
-        if (teePubkey.length == 0 || teePubkey.length > 128)
-            revert InvalidTEEPubkeyLength();
-        if (bytes(instanceUrl).length == 0) revert InvalidInstanceUrl();
-
-        // Create instance
-        instanceId = _createInstance(
-            appId,
-            versionId,
-            instanceUrl,
-            teePubkey,
-            teeWalletAddress,
-            false // zkVerified
         );
     }
 
@@ -575,6 +540,7 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         }
 
         instance.status = uint8(newStatus);
+        _removeActiveInstanceWallet(instance.teeWalletAddress);
 
         // Call removeOperator on dApp if configured
         if (app.dappContract != address(0)) {
@@ -716,6 +682,15 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         return versionInstances[appId][versionId];
     }
 
+    /// @notice Returns wallet addresses of instances currently in ACTIVE instance status for non-revoked versions for a specific app.
+    /// @param appId The application ID
+    /// @dev This list does not check app status. Consumers should validate status separately.
+    function getActiveInstances(
+        uint256 appId
+    ) external view returns (address[] memory) {
+        return _appActiveInstanceWallets[appId];
+    }
+
     // ========== Internal Functions ==========
 
     function _validateVersionOwnership(
@@ -762,6 +737,10 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
 
         walletToInstance[teeWalletAddress] = instanceId;
         versionInstances[appId][versionId].push(instanceId);
+        _activeInstanceWalletIndexPlusOne[teeWalletAddress] =
+            _appActiveInstanceWallets[appId].length +
+            1;
+        _appActiveInstanceWallets[appId].push(teeWalletAddress);
 
         emit InstanceWalletBound(teeWalletAddress, instanceId, appId);
 
@@ -785,6 +764,30 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
             instanceUrl,
             zkVerified
         );
+    }
+
+    function _removeActiveInstanceWallet(address teeWalletAddress) private {
+        uint256 instanceId = walletToInstance[teeWalletAddress];
+        if (instanceId == 0) return;
+
+        uint256 appId = _instances[instanceId].appId;
+        uint256 indexPlusOne = _activeInstanceWalletIndexPlusOne[
+            teeWalletAddress
+        ];
+        if (indexPlusOne == 0) return;
+
+        uint256 index = indexPlusOne - 1;
+        address[] storage wallets = _appActiveInstanceWallets[appId];
+        uint256 lastIndex = wallets.length - 1;
+
+        if (index != lastIndex) {
+            address movedWallet = wallets[lastIndex];
+            wallets[index] = movedWallet;
+            _activeInstanceWalletIndexPlusOne[movedWallet] = index + 1;
+        }
+
+        wallets.pop();
+        delete _activeInstanceWalletIndexPlusOne[teeWalletAddress];
     }
 
     function _validateInstanceUrl(string calldata instanceUrl) private pure {
@@ -971,6 +974,39 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
             mstore(ptr, appId)
             mstore(add(ptr, 0x20), codeMeasurement)
             measurementKey := keccak256(ptr, 0x40)
+        }
+    }
+
+    function _validateMetadataUri(string calldata uri) private pure {
+        bytes memory s = bytes(uri);
+        if (s.length == 0) return;
+
+        // Check for https:// (8 chars) or ipfs:// (7 chars)
+        // Case-insensitive check for schemes
+        bool isHttps = s.length > 8 &&
+            (s[0] == 0x68 || s[0] == 0x48) && // h or H
+            (s[1] == 0x74 || s[1] == 0x54) && // t or T
+            (s[2] == 0x74 || s[2] == 0x54) && // t or T
+            (s[3] == 0x70 || s[3] == 0x50) && // p or P
+            (s[4] == 0x73 || s[4] == 0x53) && // s or S
+            s[5] == 0x3a && // :
+            s[6] == 0x2f && // /
+            s[7] == 0x2f; // /
+
+        bool isIpfs = s.length > 7 &&
+            (s[0] == 0x69 || s[0] == 0x49) && // i or I
+            (s[1] == 0x70 || s[1] == 0x50) && // p or P
+            (s[2] == 0x66 || s[2] == 0x46) && // f or F
+            (s[3] == 0x73 || s[3] == 0x53) && // s or S
+            s[4] == 0x3a && // :
+            s[5] == 0x2f && // /
+            s[6] == 0x2f; // /
+
+        if (!isHttps && !isIpfs) revert InvalidMetadataUri();
+
+        // Disallow whitespace anywhere
+        for (uint256 i = 0; i < s.length; i++) {
+            if (s[i] == 0x20) revert InvalidMetadataUri();
         }
     }
 }

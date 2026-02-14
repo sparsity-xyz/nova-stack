@@ -38,11 +38,10 @@ The registry organizes data in a strict three-layer hierarchy:
     *   Creates the App.
     *   Enrolls new Versions (`enrollVersion`).
     *   Deprecates or Revokes versions.
-    *   Can register instances without proofs (development mode).
+    *   Submits the ZK Proof to `registerInstance` (Developer-Only Registration).
 *   **Instance Operator**:
     *   Runs the physical infrastructure (node).
     *   Deploys the Docker container.
-    *   Submits the ZK Proof to `registerInstance`.
     *   Can update instance status (e.g., STOPPED).
 
 ---
@@ -73,7 +72,7 @@ Once the measurement is enrolled, operators can deploy instances.
     *   A ZK Prover generates a proof that verifies the attestation signature and extracts the PCRs.
 
 2.  **Proof Verification**:
-    *   **Actor**: Instance Operator / Relayer
+    *   **Actor**: App Owner
     *   **Action**: Calls `registerInstance()` with the ZK Proof.
     *   **Logic**: The `NitroEnclaveVerifier` contract verifies the ZK proof on-chain.
 
