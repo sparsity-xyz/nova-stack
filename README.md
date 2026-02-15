@@ -34,7 +34,7 @@ Nova Stack consists of four core components that together provide a complete, en
 ```
 
 1. **Develop**: Use **Enclaver** to build and test your TEE application locally in mock mode or on a real Nitro Enclave.
-2. **Build**: Use **App Hub** (or your own CI/CD) to transparently build your application, producing a verifiable EIF and measurement (PCR0). The measurements are enrolled into the on-chain registry as a new **Version**.
+2. **Build**: Use **App Hub** (or your own CI/CD) to transparently build your application, producing a verifiable EIF and measurement (PCRs). The measurements are enrolled into the on-chain registry as a new **Version**.
 3. **Deploy**: Use **Enclaver** to run the built EIF on your own AWS EC2 instances with Nitro Enclave support.
 4. **Register**: Use **ZKP CLI** to obtain remote attestation from your running enclave, generate a Zero-Knowledge Proof, and register your **Instance** on-chain in the **App Registry** by verifying it against the enrolled version.
 
