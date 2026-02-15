@@ -35,9 +35,9 @@ The registry is the source of truth for TEE apps, managing:
 *   **Upgradeable**: Uses the UUPS proxy pattern for future-proof improvements.
 *   **Gas Optimized**: Efficient storage packing and optimized validation logic.
 *   **Secure Deployment Pipeline**:
-    The system performs third-party audited measurement enrollment prior to deployment.
-    After deployment, each program instance produces a zero-knowledge attestation proof, which is verified against the enrolled measurement.
-    Successfully verified executions are then registered as attested runtime instances.
+    The system performs build measurement enrollment (PCRs) to create a new **Version** prior to instance deployment.
+    After deployment, each running **Instance** produce a zero-knowledge attestation proof, which is verified against the enrolled version's measurement.
+    Successfully verified instances are then registered as **Attested Runtime Instances**, with their TEE public keys bound to the registry.
 
 ---
 _Sparsity Nova Platform - Secure TEE Computing_

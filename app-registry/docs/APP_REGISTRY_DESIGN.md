@@ -15,16 +15,16 @@ The registry organizes data in a strict three-layer hierarchy:
     *   **Status**:
         *   `ACTIVE`: The application is fully functional.
         *   `INACTIVE`: The application is paused (e.g., by owner).
-        *   `REMOVED`: The application is permanently removed (e.g., by registry owner).
+        *   `REVOKED`: The application is permanently revoked (e.g., by registry owner).
 
 2.  **Version**
     *   **Definition**: Represents a specific, immutable build of the application code.
-    *   **Key Data**: `VersionID`, `Semantic Version` (e.g., "1.0.0"), `Code Measurement` (Hash of PCRs), `Container Image URI`.
+    *   **Key Data**: `VersionID`, `Semantic Version` (e.g., "1.0.0"), `Code Measurement` (Hash of PCRs), `Container Image URI`, `Audit URL/Hash`, `GitHub Run ID`, `Status` (`ENROLLED`, `DEPRECATED`, `REVOKED`).
     *   **Role**: Defines **what** code is allowed to run. Once a version is enrolled, its code measurement is fixed. This ensures users know exactly what code is running inside the TEE.
 
 3.  **Instance**
     *   **Definition**: A live, running Enclave executing a specific `Version`.
-    *   **Key Data**: `InstanceID`, `Instance URL` (endpoint), `TEE Public Key`, `ZK Verification Status`.
+    *   **Key Data**: `InstanceID`, `AppID`, `VersionID`, `Operator`, `Instance URL`, `TEE Public Key`, `TEE Wallet Address`, `ZK Verification Status`, `Status` (`ACTIVE`, `STOPPED`, `FAILED`).
     *   **Role**: Represents **where** the code is running. Instances must prove (via ZK Proof) that they are running a valid, enrolled `Version`.
 
 ### 1.2 Roles & Permissions
@@ -88,8 +88,8 @@ Once the measurement is enrolled, operators can deploy instances.
 Developers building on Nova can act on `registerInstance` events or implement the `INovaAppInterface` to receive callbacks when new operators join their network.
 
 *   **INovaAppInterface.sol**:
-    *   `addOperator(...)`: Called when a new instance is successfully registered.
-    *   `removeOperator(...)`: Called when an instance is stopped or fails.
+    *   `addOperator(address teeWalletAddress, uint256 appId, uint256 versionId, uint256 instanceId)`: Called when a new instance is successfully registered.
+    *   `removeOperator(address teeWalletAddress, uint256 appId, uint256 versionId, uint256 instanceId)`: Called when an instance is stopped or fails.
 
 ### For Users
 Users can verify the security of an application by looking up its `AppID` on the Registry. If an instance is listed with `zkVerified = true`, it guarantees:
