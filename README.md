@@ -93,7 +93,7 @@ Smart contracts for on-chain TEE application registration and verification.
     *   **Version**: Immutable code measurements (PCRs) and metadata.
     *   **Instance**: Live running enclaves verified via ZK proofs.
 *   **NitroEnclaveVerifier**: Verifies ZK proofs of AWS Nitro attestations on-chain using SP1.
-*   **Access Control**: Granular permissions for App Owners, Instance Operators, and the Registry Admin.
+*   **Access Control**: Granular permissions for App Owners and the Registry Admin.
 *   **Upgradeable**: Built using the UUPS proxy pattern for future extensibility.
 
 ### 4. ZKP CLI

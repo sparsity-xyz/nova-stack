@@ -519,7 +519,7 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
 
         App storage app = apps[instance.appId];
 
-        // Only instance operator or app owner can update
+        // Only app owner or registry owner can update
         if (
             instance.operator != msg.sender &&
             app.owner != msg.sender &&

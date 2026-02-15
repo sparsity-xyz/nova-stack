@@ -38,11 +38,7 @@ The registry organizes data in a strict three-layer hierarchy:
     *   Creates the App.
     *   Enrolls new Versions (`enrollVersion`).
     *   Deprecates or Revokes versions.
-    *   Submits the ZK Proof to `registerInstance` (Developer-Only Registration).
-*   **Instance Operator**:
-    *   Runs the physical infrastructure (node).
-    *   Deploys the Docker container.
-    *   Can update instance status (e.g., STOPPED).
+    *   Registers and manages Instances (`registerInstance`, `updateInstanceStatus`).
 
 ---
 
