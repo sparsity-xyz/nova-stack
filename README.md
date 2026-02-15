@@ -84,7 +84,8 @@ A transparent build system using GitHub Actions. Applications submitted here are
 
 Smart contracts for on-chain TEE application registration and verification.
 
-> 🔗 **Live Deployment**: [Base Sepolia (0x0f68...4cc8)](https://sepolia.basescan.org/address/0x0f68E6e699f2E972998a1EcC000c7ce103E64cc8)
+> 🔗 **Live Deployment**: [Base Sepolia (0x0f68...4cc8)](https://sepolia.basescan.org/address/0x0f68E6e699f2E972998a1EcC000c7ce103E64cc8)  
+> 🔍 **Live App Explorer**: [https://sparsity.cloud/explore/](https://sparsity.cloud/explore/)
 
 #### Key Features
 
