@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use futures_util::stream::StreamExt;
-use log::{info, LevelFilter};
+use log::{LevelFilter, info};
 use std::future::Future;
 use std::path::PathBuf;
 use tokio::io::AsyncRead;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 const LOG_LINE_MAX_LEN: usize = 4 * 1024;
@@ -13,16 +13,15 @@ const LOG_LINE_MAX_LEN: usize = 4 * 1024;
 #[macro_export]
 macro_rules! spawn {
     ($name:expr, $body:expr) => {{
-        tokio::task::Builder::new().name($name).spawn($body).map_err(anyhow::Error::from)
+        let _ = $name;
+        Result::<_, anyhow::Error>::Ok(tokio::task::spawn($body))
     }};
 }
 
 #[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! spawn {
-    ($name:expr, $body:expr) => {{
-        Result::<_, anyhow::Error>::Ok(tokio::task::spawn($body))
-    }};
+    ($name:expr, $body:expr) => {{ Result::<_, anyhow::Error>::Ok(tokio::task::spawn($body)) }};
 }
 
 pub use spawn;
@@ -39,6 +38,7 @@ pub fn init_logging(verbosity: u8) {
     pretty_env_logger::formatted_builder()
         .filter_module("bollard", level_filter(verbosity.saturating_sub(1)))
         .filter_module("hyper", level_filter(verbosity.saturating_sub(2)))
+        .filter_module("helios", LevelFilter::Warn)
         .filter_module("tokio", level_filter(verbosity.saturating_sub(3)))
         .filter_module("tracing", level_filter(verbosity.saturating_sub(3)))
         .filter_level(level_filter(verbosity))

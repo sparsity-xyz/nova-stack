@@ -10,7 +10,7 @@ use std::{
     path::PathBuf,
     process::{ExitCode, Termination},
 };
-use tokio::io::{stdout, AsyncWriteExt};
+use tokio::io::{AsyncWriteExt, stdout};
 use tokio_util::sync::CancellationToken;
 
 const ENCLAVE_SIGNALED_EXIT_CODE: u8 = 107;
@@ -18,7 +18,12 @@ const ENCLAVE_FATAL: u8 = 108;
 const ENCLAVER_INTERRUPTED: u8 = 109;
 
 #[derive(Debug, Parser)]
-#[clap(author, version, about, long_about = None)]
+#[clap(
+    author,
+    version = env!("ENCLAVER_VERSION_WITH_GIT"),
+    about,
+    long_about = None
+)]
 struct Cli {
     #[clap(long, value_parser)]
     eif_file: Option<PathBuf>,

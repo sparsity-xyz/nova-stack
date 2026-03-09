@@ -125,8 +125,66 @@ contract GasGuzzlerNovaApp is INovaAppInterface {
     }
 }
 
+contract MalformedNitroEnclaveVerifier {
+    enum Mode {
+        DuplicatePcrZero,
+        MissingPcrOne
+    }
+
+    Mode public mode;
+
+    function setMode(Mode m) external {
+        mode = m;
+    }
+
+    function verify(
+        bytes calldata,
+        ZkCoProcessorType,
+        bytes calldata
+    ) external view returns (VerifierJournal memory) {
+        Pcr[] memory pcrs;
+        if (mode == Mode.DuplicatePcrZero) {
+            pcrs = new Pcr[](3);
+            pcrs[0] = _mkPcr(0, 1);
+            pcrs[1] = _mkPcr(0, 2);
+            pcrs[2] = _mkPcr(2, 3);
+        } else {
+            pcrs = new Pcr[](2);
+            pcrs[0] = _mkPcr(0, 1);
+            pcrs[1] = _mkPcr(2, 3);
+        }
+
+        return
+            VerifierJournal({
+                result: VerificationResult.Success,
+                trustedCertsPrefixLen: 0,
+                timestamp: 0,
+                certs: new bytes32[](0),
+                userData: bytes(
+                    '{"eth_addr":"0x1111111111111111111111111111111111111111"}'
+                ),
+                nonce: "",
+                publicKey: hex"1122",
+                pcrs: pcrs,
+                moduleId: ""
+            });
+    }
+
+    function _mkPcr(uint64 index, uint8 firstByte) private pure returns (Pcr memory) {
+        return
+            Pcr({
+                index: index,
+                value: Bytes48({
+                    first: bytes32(bytes1(firstByte)),
+                    second: bytes16(0)
+                })
+            });
+    }
+}
+
 contract NovaAppRegistryTest is Test {
     bytes32 constant NITRO_ARCH = "nitro";
+    event ZKVerifierChanged(address indexed verifier);
     event VersionEnrolled(
         uint256 indexed appId,
         uint256 indexed versionId,
@@ -179,6 +237,7 @@ contract NovaAppRegistryTest is Test {
         NovaAppRegistry.AppStatus newStatus,
         address indexed updatedBy
     );
+    event AppWalletSet(uint256 indexed appId, address indexed appWallet);
 
     NovaAppRegistry private registry;
     MockNovaApp private mockDapp;
@@ -236,24 +295,125 @@ contract NovaAppRegistryTest is Test {
             codeMeasurement
         );
 
+        bytes memory publicValues = _buildMockPublicValues(teePubkey, teeWallet);
+
+        return _registerInstanceWithPublicValues(
+            appId,
+            versionId,
+            instanceUrl,
+            publicValues
+        );
+    }
+
+    function _createAppAndEnrollDefaultVersion(
+        address dappContract
+    ) private returns (uint256 appId, uint256 versionId, bytes32 codeMeasurement) {
+        vm.prank(alice);
+        appId = registry.createApp(NITRO_ARCH, dappContract, "ipfs://meta");
+
+        bytes memory pcr0 = _mkPcr(1);
+        bytes memory pcr1 = _mkPcr(2);
+        bytes memory pcr2 = _mkPcr(3);
+        codeMeasurement = keccak256(abi.encodePacked(pcr0, pcr1, pcr2));
+
+        vm.prank(alice);
+        versionId = registry.enrollVersion(
+            appId,
+            "1.0.0",
+            pcr0,
+            pcr1,
+            pcr2,
+            "img",
+            "audit",
+            "hash",
+            "run"
+        );
+    }
+
+    function _setupAppWithDefaultVersion(
+        address dappContract
+    ) private returns (uint256 appId, uint256 versionId) {
+        bytes32 ignoredCodeMeasurement;
+        (appId, versionId, ignoredCodeMeasurement) = _createAppAndEnrollDefaultVersion(
+            dappContract
+        );
+    }
+
+    function _registerDefaultInstanceForAppWalletTests(
+        uint256 appId,
+        uint256 versionId,
+        string memory instanceUrl,
+        bytes memory teePubkey,
+        address teeWallet
+    ) private returns (uint256 instanceId) {
+        bytes memory publicValues = _buildMockPublicValues(teePubkey, teeWallet);
+        vm.prank(alice);
+        instanceId = _registerInstanceWithPublicValues(
+            appId,
+            versionId,
+            instanceUrl,
+            publicValues
+        );
+    }
+
+    function _deriveDeterministicTestWallet(
+        string memory label,
+        uint256 appId
+    ) private pure returns (address) {
+        uint256 walletPk = uint256(keccak256(abi.encodePacked(label, appId)));
+        return vm.addr(walletPk);
+    }
+
+    function _buildMockPublicValues(
+        bytes memory teePubkey,
+        address teeWallet
+    ) private pure returns (bytes memory) {
+        return
+            _buildMockPublicValuesWithResult(
+                teePubkey,
+                teeWallet,
+                VerificationResult.Success
+            );
+    }
+
+    function _buildMockPublicValuesWithResult(
+        bytes memory teePubkey,
+        address teeWallet,
+        VerificationResult result
+    ) private pure returns (bytes memory publicValues) {
+        bytes memory userData = bytes(
+            string.concat('{"eth_addr":"', _addressToHex(teeWallet), '"}')
+        );
+        publicValues = _buildMockPublicValuesRaw(teePubkey, userData, result);
+    }
+
+    function _buildMockPublicValuesRaw(
+        bytes memory teePubkey,
+        bytes memory userData,
+        VerificationResult result
+    ) private pure returns (bytes memory publicValues) {
         bytes32[3] memory pcrFirst = [
             bytes32(bytes1(uint8(1))),
             bytes32(bytes1(uint8(2))),
             bytes32(bytes1(uint8(3)))
         ];
         bytes16[3] memory pcrSecond;
-        bytes memory userData = bytes(
-            string.concat('{"eth_addr":"', _addressToHex(teeWallet), '"}')
-        );
 
-        bytes memory publicValues = abi.encode(
+        publicValues = abi.encode(
             pcrFirst,
             pcrSecond,
             userData,
             teePubkey,
-            VerificationResult.Success
+            result
         );
+    }
 
+    function _registerInstanceWithPublicValues(
+        uint256 appId,
+        uint256 versionId,
+        string memory instanceUrl,
+        bytes memory publicValues
+    ) private returns (uint256) {
         return
             registry.registerInstance(
                 appId,
@@ -408,6 +568,191 @@ contract NovaAppRegistryTest is Test {
         assertEq(mockDapp.lastAppId(), appId);
         assertEq(mockDapp.lastVersionId(), versionId);
         assertEq(mockDapp.lastInstanceId(), instanceId);
+    }
+
+    function test_registerInstance_doesNotSetAppWallet() public {
+        (
+            uint256 appId,
+            uint256 versionId,
+            bytes32 codeMeasurement
+        ) = _createAppAndEnrollDefaultVersion(address(mockDapp));
+
+        vm.prank(alice);
+        uint256 instanceId = _registerInstanceWithMockProof(
+            appId,
+            versionId,
+            "http://1.2.3.4:8000",
+            hex"112233",
+            address(0x1234567890AbcdEF1234567890aBcdef12345678),
+            codeMeasurement
+        );
+        assertGt(instanceId, 0);
+
+        NovaAppRegistry.App memory appInfo = registry.getApp(appId);
+        assertEq(appInfo.appWallet, address(0));
+    }
+
+    function test_registerInstance_keepsAppWalletUnsetBeforeAnchoring() public {
+        (uint256 appId, uint256 versionId) = _setupAppWithDefaultVersion(
+            address(mockDapp)
+        );
+
+        uint256 instanceId = _registerDefaultInstanceForAppWalletTests(
+            appId,
+            versionId,
+            "http://no-app-wallet",
+            hex"cafebabe",
+            address(0x1111111111111111111111111111111111111111)
+        );
+        assertGt(instanceId, 0);
+
+        NovaAppRegistry.App memory appInfo = registry.getApp(appId);
+        assertEq(appInfo.appWallet, address(0));
+    }
+
+    function test_setAppWalletIfUnset_setsWalletAfterUnsetRegistration() public {
+        (uint256 appId, uint256 versionId) = _setupAppWithDefaultVersion(
+            address(mockDapp)
+        );
+
+        uint256 instanceId = _registerDefaultInstanceForAppWalletTests(
+            appId,
+            versionId,
+            "http://no-app-wallet",
+            hex"cafebabe",
+            address(0x1111111111111111111111111111111111111111)
+        );
+        assertGt(instanceId, 0);
+
+        address appWallet = _deriveDeterministicTestWallet(
+            "post-set-app-wallet",
+            appId
+        );
+
+        vm.expectEmit(true, true, false, true);
+        emit AppWalletSet(appId, appWallet);
+
+        vm.prank(alice);
+        registry.setAppWalletIfUnset(appId, appWallet);
+
+        NovaAppRegistry.App memory appInfo = registry.getApp(appId);
+        assertEq(appInfo.appWallet, appWallet);
+    }
+
+    function test_setAppWalletIfUnset_revertsForNonOwner() public {
+        (uint256 appId, uint256 versionId) = _setupAppWithDefaultVersion(
+            address(mockDapp)
+        );
+
+        _registerDefaultInstanceForAppWalletTests(
+            appId,
+            versionId,
+            "http://no-app-wallet",
+            hex"cafebabe",
+            address(0x1111111111111111111111111111111111111111)
+        );
+
+        address appWallet = _deriveDeterministicTestWallet(
+            "post-set-app-wallet",
+            appId
+        );
+
+        vm.prank(bob);
+        vm.expectRevert(NovaAppRegistry.NotAppOwner.selector);
+        registry.setAppWalletIfUnset(appId, appWallet);
+        assertEq(registry.getApp(appId).appWallet, address(0));
+    }
+
+    function test_setAppWalletIfUnset_revertsWhenAlreadySet() public {
+        (uint256 appId, uint256 versionId) = _setupAppWithDefaultVersion(
+            address(mockDapp)
+        );
+
+        _registerDefaultInstanceForAppWalletTests(
+            appId,
+            versionId,
+            "http://no-app-wallet",
+            hex"cafebabe",
+            address(0x1111111111111111111111111111111111111111)
+        );
+
+        address appWallet = _deriveDeterministicTestWallet(
+            "post-set-app-wallet",
+            appId
+        );
+
+        vm.prank(alice);
+        registry.setAppWalletIfUnset(appId, appWallet);
+
+        vm.prank(alice);
+        vm.expectRevert(NovaAppRegistry.AppWalletMismatch.selector);
+        registry.setAppWalletIfUnset(appId, appWallet);
+
+        address otherWallet = _deriveDeterministicTestWallet(
+            "post-set-app-wallet-other",
+            appId
+        );
+        vm.prank(alice);
+        vm.expectRevert(NovaAppRegistry.AppWalletMismatch.selector);
+        registry.setAppWalletIfUnset(appId, otherWallet);
+        assertEq(registry.getApp(appId).appWallet, appWallet);
+    }
+
+    function test_registerInstance_worksAfterAppWalletAnchoring() public {
+        (uint256 appId, uint256 versionId) = _setupAppWithDefaultVersion(
+            address(mockDapp)
+        );
+
+        _registerDefaultInstanceForAppWalletTests(
+            appId,
+            versionId,
+            "http://a",
+            hex"112233",
+            address(0x1111111111111111111111111111111111111111)
+        );
+        address anchoredAppWallet = _deriveDeterministicTestWallet(
+            "anchored-wallet",
+            appId
+        );
+
+        vm.prank(alice);
+        registry.setAppWalletIfUnset(appId, anchoredAppWallet);
+
+        address secondTeeWallet = address(
+            0x2222222222222222222222222222222222222222
+        );
+        bytes memory secondPublicValues = _buildMockPublicValues(
+            hex"445566",
+            secondTeeWallet
+        );
+
+        vm.prank(alice);
+        uint256 secondInstanceId = _registerInstanceWithPublicValues(
+            appId,
+            versionId,
+            "http://b",
+            secondPublicValues
+        );
+        assertGt(secondInstanceId, 0);
+        assertEq(registry.getApp(appId).appWallet, anchoredAppWallet);
+    }
+
+    function test_setAppWalletIfUnset_revertsOnZeroWallet() public {
+        (uint256 appId, uint256 versionId) = _setupAppWithDefaultVersion(
+            address(mockDapp)
+        );
+
+        _registerDefaultInstanceForAppWalletTests(
+            appId,
+            versionId,
+            "http://zero-wallet",
+            hex"778899",
+            address(0x3333333333333333333333333333333333333333)
+        );
+
+        vm.prank(alice);
+        vm.expectRevert(NovaAppRegistry.InvalidAppWalletAddress.selector);
+        registry.setAppWalletIfUnset(appId, address(0));
     }
 
     function test_registerInstance_revertsOnDuplicateWallet() public {
@@ -1668,6 +2013,287 @@ contract NovaAppRegistryTest is Test {
             ADDRESS1,
             keccak256(abi.encodePacked(_mkPcr(1), _mkPcr(2), _mkPcr(3)))
         );
+    }
+
+    function test_setZkVerifier_updatesAndEmitsEvent() public {
+        MockNitroEnclaveVerifier replacementVerifier = new MockNitroEnclaveVerifier();
+
+        vm.expectEmit(true, false, false, true);
+        emit ZKVerifierChanged(address(replacementVerifier));
+        registry.setZkVerifier(address(replacementVerifier));
+
+        assertEq(address(registry.zkVerifier()), address(replacementVerifier));
+    }
+
+    function test_setZkVerifier_revertsForZeroAndEoa() public {
+        vm.expectRevert(NovaAppRegistry.InvalidZkVerifier.selector);
+        registry.setZkVerifier(address(0));
+
+        vm.expectRevert(NovaAppRegistry.InvalidZkVerifier.selector);
+        registry.setZkVerifier(alice);
+    }
+
+    function test_getAppsByOwner_returnsOwnedAppIdsInOrder() public {
+        vm.prank(alice);
+        registry.createApp(NITRO_ARCH, address(0), "ipfs://alice-1");
+
+        vm.prank(bob);
+        registry.createApp(NITRO_ARCH, address(0), "ipfs://bob-1");
+
+        vm.prank(alice);
+        registry.createApp(NITRO_ARCH, address(0), "ipfs://alice-2");
+
+        uint256[] memory aliceApps = registry.getAppsByOwner(alice);
+        assertEq(aliceApps.length, 2);
+        assertEq(aliceApps[0], 1);
+        assertEq(aliceApps[1], 3);
+
+        uint256[] memory bobApps = registry.getAppsByOwner(bob);
+        assertEq(bobApps.length, 1);
+        assertEq(bobApps[0], 2);
+    }
+
+    function test_versionGetters_returnLatestAndMeasurementIndex() public {
+        (uint256 appId, uint256 v1, bytes32 cm1) = _createAppAndEnrollDefaultVersion(
+            address(mockDapp)
+        );
+        assertEq(v1, 1);
+        assertEq(registry.getVersionCount(appId), 1);
+        assertEq(registry.getVersionByCodeMeasurement(appId, cm1), v1);
+
+        bytes memory pcr0 = _mkPcr(4);
+        bytes memory pcr1 = _mkPcr(5);
+        bytes memory pcr2 = _mkPcr(6);
+        bytes32 cm2 = keccak256(abi.encodePacked(pcr0, pcr1, pcr2));
+
+        vm.prank(alice);
+        uint256 v2 = registry.enrollVersion(
+            appId,
+            "2.0.0",
+            pcr0,
+            pcr1,
+            pcr2,
+            "img-2",
+            "audit-2",
+            "hash-2",
+            "run-2"
+        );
+
+        NovaAppRegistry.AppVersion memory latest = registry.getLatestVersion(appId);
+        assertEq(v2, 2);
+        assertEq(latest.versionId, v2);
+        assertEq(latest.codeMeasurement, cm2);
+        assertEq(registry.getVersionCount(appId), 2);
+        assertEq(registry.getVersionByCodeMeasurement(appId, cm2), v2);
+    }
+
+    function test_instancesCompatibilityGetter_matchesGetInstance() public {
+        (uint256 appId, uint256 versionId, bytes32 codeMeasurement) = _createAppAndEnrollDefaultVersion(
+            address(mockDapp)
+        );
+        address teeWallet = address(0x1234567890AbcdEF1234567890aBcdef12345678);
+
+        vm.prank(alice);
+        uint256 instanceId = _registerInstanceWithMockProof(
+            appId,
+            versionId,
+            "http://instance-compat",
+            hex"123456",
+            teeWallet,
+            codeMeasurement
+        );
+
+        (
+            uint256 rawInstanceId,
+            uint256 rawAppId,
+            uint256 rawVersionId,
+            address rawOperator,
+            string memory rawUrl,
+            bytes memory rawPubkey,
+            address rawWallet,
+            bool rawZkVerified,
+            NovaAppRegistry.InstanceStatus rawStatus,
+            uint256 rawRegisteredAt
+        ) = registry.instances(instanceId);
+
+        NovaAppRegistry.RuntimeInstance memory full = registry.getInstance(instanceId);
+        assertEq(rawInstanceId, full.instanceId);
+        assertEq(rawAppId, full.appId);
+        assertEq(rawVersionId, full.versionId);
+        assertEq(rawOperator, full.operator);
+        assertEq(rawUrl, full.instanceUrl);
+        assertEq(rawPubkey, full.teePubkey);
+        assertEq(rawWallet, full.teeWalletAddress);
+        assertEq(rawZkVerified, full.zkVerified);
+        assertEq(uint8(rawStatus), uint8(full.status));
+        assertEq(rawRegisteredAt, full.registeredAt);
+    }
+
+    function test_registerInstance_allowsHttpsSchemeCaseInsensitive() public {
+        (uint256 appId, uint256 versionId, bytes32 codeMeasurement) = _createAppAndEnrollDefaultVersion(
+            address(mockDapp)
+        );
+
+        vm.prank(alice);
+        uint256 instanceId = _registerInstanceWithMockProof(
+            appId,
+            versionId,
+            "hTtPs://EXAMPLE",
+            hex"1122",
+            address(0x1111111111111111111111111111111111111111),
+            codeMeasurement
+        );
+        assertGt(instanceId, 0);
+    }
+
+    function test_registerInstance_revertsOnCodeMeasurementMismatch() public {
+        vm.prank(alice);
+        uint256 appId = registry.createApp(NITRO_ARCH, address(mockDapp), "ipfs://meta");
+
+        bytes memory pcr0 = _mkPcr(4);
+        bytes memory pcr1 = _mkPcr(5);
+        bytes memory pcr2 = _mkPcr(6);
+        vm.prank(alice);
+        uint256 versionId = registry.enrollVersion(
+            appId,
+            "1.0.0",
+            pcr0,
+            pcr1,
+            pcr2,
+            "img",
+            "audit",
+            "hash",
+            "run"
+        );
+
+        address teeWallet = address(0x1111111111111111111111111111111111111111);
+
+        bytes memory publicValues = _buildMockPublicValues(hex"112233", teeWallet);
+
+        vm.prank(alice);
+        vm.expectRevert(NovaAppRegistry.CodeMeasurementMismatch.selector);
+        _registerInstanceWithPublicValues(
+            appId,
+            versionId,
+            "http://mismatch",
+            publicValues
+        );
+    }
+
+    function test_registerInstance_revertsOnAttestationFailureResult() public {
+        (uint256 appId, uint256 versionId, ) = _createAppAndEnrollDefaultVersion(
+            address(mockDapp)
+        );
+        address teeWallet = address(0x1111111111111111111111111111111111111111);
+
+        bytes memory publicValues = _buildMockPublicValuesWithResult(
+            hex"11",
+            teeWallet,
+            VerificationResult.InvalidTimestamp
+        );
+
+        vm.prank(alice);
+        vm.expectRevert(NovaAppRegistry.AttestationFailed.selector);
+        _registerInstanceWithPublicValues(
+            appId,
+            versionId,
+            "http://attestation-fail",
+            publicValues
+        );
+    }
+
+    function test_registerInstance_revertsOnJsonParsingFailure() public {
+        (uint256 appId, uint256 versionId, ) = _createAppAndEnrollDefaultVersion(
+            address(mockDapp)
+        );
+        bytes memory publicValues = _buildMockPublicValuesRaw(
+            hex"11",
+            bytes("not-a-json-payload"),
+            VerificationResult.Success
+        );
+
+        vm.prank(alice);
+        vm.expectRevert(NovaAppRegistry.JsonParsingFailed.selector);
+        _registerInstanceWithPublicValues(
+            appId,
+            versionId,
+            "http://json-fail",
+            publicValues
+        );
+    }
+
+    function test_registerInstance_revertsOnInvalidTeePubkeyLength() public {
+        (uint256 appId, uint256 versionId, ) = _createAppAndEnrollDefaultVersion(
+            address(mockDapp)
+        );
+        address teeWallet = address(0x1111111111111111111111111111111111111111);
+
+        bytes memory publicValues = _buildMockPublicValues(hex"", teeWallet);
+
+        vm.prank(alice);
+        vm.expectRevert(NovaAppRegistry.InvalidTEEPubkeyLength.selector);
+        _registerInstanceWithPublicValues(
+            appId,
+            versionId,
+            "http://invalid-pubkey",
+            publicValues
+        );
+    }
+
+    function test_registerInstance_revertsOnDuplicatePcrIndexFromVerifier() public {
+        (uint256 appId, uint256 versionId, ) = _createAppAndEnrollDefaultVersion(
+            address(mockDapp)
+        );
+
+        MalformedNitroEnclaveVerifier malformed = new MalformedNitroEnclaveVerifier();
+        registry.setZkVerifier(address(malformed));
+
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                NovaAppRegistry.DuplicatePCRIndex.selector,
+                uint64(0)
+            )
+        );
+        registry.registerInstance(
+            appId,
+            versionId,
+            "http://dup-pcr",
+            ZkCoProcessorType.RiscZero,
+            hex"",
+            hex""
+        );
+    }
+
+    function test_registerInstance_revertsOnMissingPcrIndexFromVerifier() public {
+        (uint256 appId, uint256 versionId, ) = _createAppAndEnrollDefaultVersion(
+            address(mockDapp)
+        );
+
+        MalformedNitroEnclaveVerifier malformed = new MalformedNitroEnclaveVerifier();
+        malformed.setMode(MalformedNitroEnclaveVerifier.Mode.MissingPcrOne);
+        registry.setZkVerifier(address(malformed));
+
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                NovaAppRegistry.MissingPCRIndex.selector,
+                uint64(1)
+            )
+        );
+        registry.registerInstance(
+            appId,
+            versionId,
+            "http://missing-pcr",
+            ZkCoProcessorType.RiscZero,
+            hex"",
+            hex""
+        );
+    }
+
+    function test_updateInstanceStatus_revertsWhenInstanceNotFound() public {
+        vm.expectRevert(NovaAppRegistry.InstanceNotFound.selector);
+        registry.updateInstanceStatus(999999, NovaAppRegistry.InstanceStatus.STOPPED);
     }
 
     function test_upgradeCompatibility_preservesLegacyStorageLayout() public {

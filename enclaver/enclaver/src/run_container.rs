@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
+use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::models::{ContainerCreateBody, DeviceMapping, HostConfig, PortBinding, PortMap};
 use bollard::query_parameters::{
     CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
     StopContainerOptions, WaitContainerOptions,
 };
-use bollard::Docker;
 use futures_util::stream::{StreamExt, TryStreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ impl Sleeve {
             return Err(anyhow!("container already running"));
         }
 
-        let port_re = regex::Regex::new(r"(\d+):(\d+)")?;
+        let port_re = regex::Regex::new(r"^(\d+):(\d+)$")?;
 
         let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
         let mut port_bindings = PortMap::new();
@@ -87,11 +87,7 @@ impl Sleeve {
                             cmd.push(memory_mb.to_string());
                         }
 
-                        if cmd.is_empty() {
-                            None
-                        } else {
-                            Some(cmd)
-                        }
+                        if cmd.is_empty() { None } else { Some(cmd) }
                     },
                     attach_stderr: Some(true),
                     attach_stdout: Some(true),

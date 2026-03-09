@@ -100,9 +100,62 @@ Individual targets are also available, e.g., `make verify-nova-basescan`.
 | `verify-all-basescan` | Verify all on Basescan |
 | `test` | Run tests |
 
-## 9. Troubleshooting
+## 9. RegisterInstance & App Wallet Anchoring
+
+`registerInstance` uses only app/version + ZK proof inputs:
+
+```solidity
+registerInstance(
+  uint256 appId,
+  uint256 versionId,
+  string instanceUrl,
+  ZkCoProcessorType zkCoprocessor,
+  bytes publicValues,
+  bytes proofBytes
+)
+```
+
+Behavior:
+- Instance registration is based only on app/version ownership and ZK attestation verification.
+
+App wallet anchoring is a separate explicit step:
+
+```solidity
+setAppWalletIfUnset(
+  uint256 appId,
+  address appWallet
+)
+```
+
+Rules:
+- `setAppWalletIfUnset` can only be called by the app owner.
+- `setAppWalletIfUnset` succeeds only when the current app wallet is unset.
+- Any later call reverts with `AppWalletMismatch`.
+- No signature proof or deadline is required.
+
+## 10. Troubleshooting
 
 *   **"No deployments found"**: Run `make deploy-nova` first.
 *   **"Unauthorized()"**: Ensure you are using the same private key that deployed the contracts (the owner).
 *   **Verification fails**: Wait a few minutes after deployment for the explorer to index the contract.
 *   **"match" reserved keyword**: Update your code (we use Solidity 0.8.33 which avoids old reserved keywords).
+
+## 11. Nova Platform Integration Notes (Control Plane)
+
+To keep registry integrations consistent across API endpoints:
+
+- Use `control-plane/app/services/nova_registry.py:NOVA_REGISTRY_ABI` as the canonical ABI source for control-plane reads/writes.
+- Avoid duplicating partial ABI fragments in other modules (for example, signature-verification flows should import the shared ABI).
+- `web3.py` is synchronous; when calling registry functions from `async def` handlers/services, run RPC operations in a worker thread (for example, via `asyncio.to_thread`) to avoid blocking the FastAPI event loop.
+
+These constraints reduce ABI drift bugs and improve runtime responsiveness under concurrent request load.
+
+## 12. Explorer App-Wallet View
+
+Portal explorer pages (`AppExplorer` / `ExplorerAppView`) now surface the latest on-chain `appWallet` from `getApp(appId)`:
+
+- Card/list pages show whether an app wallet is anchored.
+- App detail page shows `App Wallet` and links to BaseScan when anchored.
+- Search now supports app-wallet address text.
+
+If the value appears as zero address, it means app-wallet anchoring has not happened yet for that app.

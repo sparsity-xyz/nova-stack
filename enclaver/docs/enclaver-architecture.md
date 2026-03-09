@@ -1,201 +1,216 @@
-## Enclaver — Architecture and Module Reference
+# Enclaver Architecture and Module Reference
 
-Date: 2025-10-27
+This document maps repository files to the build and runtime behavior implemented today.
 
-This document describes the key modules in the `enclaver` crate, how they interact, and the Docker image / layer layout used when building and running Enclaver packages.
+## Top-level concerns
 
-Overview
---------
-- Enclaver packages a user application Docker image into an AWS Nitro Enclaves-compatible EIF, then wraps that EIF into a "sleeve" OCI image for deployment and local runtime.
-- Main concerns:
-  - Build-time pipeline: amend app image, produce EIF via `nitro-cli`, package EIF into release image.
-  - Runtime: run the release image (sleeve), start an enclave with `nitro-cli`, provide vsock proxying for ingress/egress, and monitor enclave status/logs.
-  - Supporting services: egress/ingress proxies, optional KMS attestation proxy.
+The codebase has three execution domains:
 
-Repository layout (important files)
-----------------------------------
-- `enclaver/src/lib.rs` — crate module list.
-- `enclaver/src/build.rs` — build pipeline, `EnclaveArtifactBuilder`.
-- `enclaver/src/images.rs` — Docker image operations and layer builder.
-- `enclaver/src/nitro_cli_container.rs` — run `nitro-cli` inside a container (build -> EIF).
-- `enclaver/src/nitro_cli.rs` — run `nitro-cli` on the host (runtime control).
-- `enclaver/src/manifest.rs` — `enclaver.yaml` schema and loader.
-- `enclaver/src/run.rs` — enclave runtime orchestration (feature `run_enclave`).
-- `enclaver/src/run_container.rs` — start and stream the sleeve container image on the host.
-- `enclaver/src/bin/odyn/helios_rpc.rs` — Helios Ethereum/OP Stack light client RPC service.
-- `enclaver/src/proxy/` — network proxy implementations: `ingress`, `egress_http`, (optionally) `kms`, `pkcs7`.
-- `enclaver/src/policy/` — egress allow/deny (domain/ip pattern filters).
-- `enclaver/src/vsock.rs` — vsock helper wrappers and TLS-on-vsock helpers.
-- `enclaver/src/tls.rs` — rustls config helpers and test helpers.
-- `dockerfiles/` and `scripts/build-docker-images.sh` — Dockerfiles & scripts used to prepare runtime/dev images.
+1. build time
+   - turn an app image into an amended image
+   - convert that image into an EIF
+   - package the EIF into a Sleeve image
 
-Top-level modules and responsibilities
--------------------------------------
+2. host/container runtime
+   - run the Sleeve image
+   - launch the enclave with `nitro-cli`
+   - provide host-side ingress, egress, log, status, and clock-sync plumbing
 
-- build (`src/build.rs`)
-  - Orchestrates building a release image from a manifest.
-  - Steps: resolve sources (app, odyn, sleeve), amend the app image by adding manifest and `odyn`, convert amended image to EIF (via `nitro-cli` inside container), package EIF into sleeve image.
-  - Types: `EnclaveArtifactBuilder`, `ResolvedSources`.
+3. enclave runtime
+   - run `odyn` as PID 1
+   - provide local platform services
+   - launch the user process
 
-- images (`src/images.rs`)
-  - Abstraction over Docker operations using `bollard`.
-  - Key types: `ImageManager`, `ImageRef`, `LayerBuilder` and `FileBuilder`.
-  - `append_layer` streams a docker build context and returns resulting image id.
+## Key modules
 
-- nitro_cli_container (`src/nitro_cli_container.rs`)
-  - Runs `nitro-cli` inside a dedicated container image to produce EIFs.
-  - Provides helpers to create container, stream stdout/stderr, wait and remove container.
+### Build path
 
-- nitro_cli (`src/nitro_cli.rs`)
-  - Runs `nitro-cli` on the host (used by runtime `enclaver-run`).
-  - Builds CLI args, parses JSON outputs (e.g., `EnclaveInfo`, `EIFInfo`).
+- `enclaver/src/build.rs`
+  - main build orchestration
+  - resolves default images
+  - injects `/sbin/odyn` and `/etc/enclaver/enclaver.yaml`
+  - packages `/enclave/application.eif` and `/enclave/enclaver.yaml`
 
-- run_container (`src/run_container.rs`)
-  - Host-side helper to start the final sleeve image (mounts `/dev/nitro_enclaves`), stream logs, and cleanup.
-  - Type: `Sleeve`.
+- `enclaver/src/images.rs`
+  - Docker image operations and layer append logic
 
-- run (`src/run.rs`) (feature `run_enclave`)
-  - Enclave runtime orchestrator: starts egress proxy, runs enclave with `nitro-cli`, attaches debug console, streams logs, starts ingress proxies, monitors enclave status port and cleans up.
-  - Types: `Enclave`, `EnclaveOpts`, `EnclaveExitStatus`.
+- `enclaver/src/nitro_cli_container.rs`
+  - runs `nitro-cli build-enclave` inside a container
 
-- proxy (`src/proxy/*`)
-  - `ingress.rs`: `EnclaveProxy` (vsock listener inside enclave; TLS termination) and `HostProxy` (host listener forwarding to vsock).
-  - `egress_http.rs`: inside-enclave HTTP proxy + host-side vsock proxy for outbound HTTP(S); supports CONNECT and normal proxying; enforces `policy::EgressPolicy`.
-  - `kms.rs` (feature `odyn`): KMS request proxy that inserts attestation and decrypts `CiphertextForRecipient` using PKCS#7.
-  - `pkcs7.rs`: parsing and decrypting PKCS#7 EnvelopedData.
+- `enclaver/src/manifest.rs`
+  - manifest schema
+  - validation rules
+  - effective defaults such as default-on `clock_sync`
 
-- policy (`src/policy/*`)
-  - `domain_filter.rs`: domain pattern matching with `*` and `**` semantics.
-  - `ip_filter.rs`: CIDR/IP matching using `ipnetwork`.
-  - `EgressPolicy` composes domain/IP allow/deny lists and exposes `is_host_allowed(host: &str)`.
+### Host/runtime path
 
-- nsm (`src/nsm.rs`) (feature `odyn`)
-  - Wrapper around AWS Nitro Enclaves NSM driver. Exposes `AttestationProvider` trait and `NsmAttestationProvider` plus a `StaticAttestationProvider` used in tests.
+- `enclaver/src/run_container.rs`
+  - Docker wrapper for running the Sleeve image
+  - mounts `/dev/nitro_enclaves`
+  - sets `privileged: true`
+  - wires `-p/--publish` host port mappings
 
-- api (`src/api.rs`) (feature `odyn`)
-  - Small HTTP handler exposing `/v1/attestation` (POST) to return attestation docs, `/v1/encryption/*` endpoints for ECDH-based encryption/decryption, and `/v1/eth/*` for Ethereum key operations.
+- `enclaver/src/run.rs`
+  - runtime orchestrator inside the Sleeve container
+  - starts host-side egress proxy
+  - starts host-side clock-sync server
+  - launches the enclave with `nitro-cli`
+  - attaches debug console if requested
+  - streams status/logs
+  - starts host-side ingress proxies
 
-- helios_rpc (`src/bin/odyn/helios_rpc.rs`)
-  - Trustless Ethereum/OP Stack light client RPC service that runs inside the enclave and verifies execution data via consensus proofs.
+- `enclaver/src/nitro_cli.rs`
+  - host-side `nitro-cli` wrapper for `run-enclave`, `terminate-enclave`, `describe-eif`, and console access
 
-- encryption_key (`src/encryption_key.rs`) (feature `odyn`)
-  - P-384 ECDH key pair management for secure client-enclave encryption. Provides DER/PEM encoding, shared key derivation via ECDH + HKDF, and AES-256-GCM encrypt/decrypt operations.
+### Odyn path
 
-- tls (`src/tls.rs`) (feature `proxy`)
-  - rustls config loaders and `NoCertificateVerification` test helper.
+- `enclaver/src/bin/odyn/main.rs`
+  - startup and shutdown order
 
-- utils (`src/utils.rs`)
-  - Logging init, spawn macro, path helpers, reading logs from streams and shutdown signal registration.
+- `enclaver/src/bin/odyn/config.rs`
+  - runtime configuration helpers
+  - important detail: if `api` is enabled, Aux API also starts by default on `api.listen_port + 1`
 
-Call relationships and runtime flows
-----------------------------------
+- `enclaver/src/bin/odyn/enclave.rs`
+  - loopback setup and RNG seeding from NSM
 
-Build-time flow (high level):
+- `enclaver/src/bin/odyn/egress.rs`
+  - enclave-side HTTP proxy
+  - sets uppercase and lowercase proxy env vars
 
-1. CLI `enclaver build` -> `build::EnclaveArtifactBuilder::build_release(manifest)`.
-2. `manifest::load_manifest` reads `enclaver.yaml`.
-3. `images::ImageManager` resolves `sources.app` image (pulls if necessary).
-4. `amend_source_image` appends a layer to the app image containing the manifest and the `odyn` binary and sets ENTRYPOINT to run `/sbin/odyn --config-dir /etc/enclaver -- <app-entrypoint+cmd>`.
-5. `image_to_eif` tags the amended image with a temporary tag and runs `nitro-cli build-enclave` inside a `nitro-cli` container (via `nitro_cli_container::NitroCLIContainer`) to produce `application.eif`.
-6. `package_eif` appends the `application.eif` and `enclaver.yaml` into the `sleeve` base image to form the final release image (tagged with `manifest.target`).
+- `enclaver/src/bin/odyn/clock_sync.rs`
+  - default-on clock sync client
+  - initial sync plus periodic sync
 
-Runtime flow (running a release image locally)
+- `enclaver/src/bin/odyn/helios_rpc.rs`
+  - Helios Ethereum/OP Stack light-client RPC services
+  - background startup, with readiness wait on port `18545` only for registry-backed KMS
 
-1. Host `enclaver run` -> `run_container::Sleeve` creates and starts the sleeve container, mapping `/dev/nitro_enclaves` into the container.
-2. Inside the sleeve image, the `enclaver-run` binary (`src/bin/enclaver-run`) is the container entrypoint; it constructs `Enclave` and calls `Enclave::run`.
-3. `Enclave::run` starts the host-side egress proxy (`HostHttpProxy` -> vsock listener on host), then calls `nitro-cli run-enclave` to start the enclave.
-4. After enclave start, `Enclave`:
-   - attaches debug console if requested;
-   - starts a log stream by connecting to vsock `APP_LOG_PORT` for application logs;
-   - starts ingress proxies for any `ingress` entries in the manifest; the host provides `HostProxy` listening on host ports and forwarding to the enclave vsock; inside the enclave `EnclaveProxy` terminates TLS and forwards to local app TCP sockets;
-   - monitors the status vsock `STATUS_PORT` for process status updates (exited/signaled/fatal).
+- `enclaver/src/bin/odyn/api.rs`
+  - starts the Internal API server
+  - wires S3 and Nova KMS integrations
 
-Egress (HTTP) topology
-----------------------
+- `enclaver/src/bin/odyn/aux_api.rs`
+  - starts the restricted proxy API
 
-- Inside enclave: application -> local HTTP proxy (`EnclaveHttpProxy`) listening on localhost.
-- `EnclaveHttpProxy` opens a vsock to the host at `HTTP_EGRESS_VSOCK_PORT` and requests the host connect to the remote host:port.
-- Host: `HostHttpProxy` receives the request, connects to remote endpoint and pipes data back/forth over vsock.
-- `EgressPolicy` enforces allow/deny lists from `enclaver.yaml` (domain and/or IP rules).
+- `enclaver/src/bin/odyn/ingress.rs`
+  - enclave-side ingress listeners
 
-Ingress topology
-----------------
+- `enclaver/src/bin/odyn/console.rs`
+  - stdout/stderr capture
+  - status and log VSOCK services
 
-- Host listens on configured host TCP ports (via `HostProxy`), accepts incoming connections and forwards them over vsock to the enclave.
-- Inside the enclave, `EnclaveProxy` accepts vsock connections (optionally TLS-terminated) and forwards to the enclave-local app TCP socket.
+- `enclaver/src/bin/odyn/launcher.rs`
+  - launches the user process
+  - reaps children
 
-KMS attestation / special handling (feature `odyn`)
---------------------------------------------------
+## Shared library modules used by Odyn
 
-- `proxy::kms` inspects KMS requests that require attestation (Decrypt, GenerateDataKey, GenerateDataKeyPair, DeriveSharedSecret, GenerateRandom).
-- For attesting actions it requests an attestation document from `nsm` (or `StaticAttestationProvider` in tests), inserts a `Recipient` structure into the request body, re-signs the request (SigV4) with AWS credentials, forwards to KMS, and on response decrypts `CiphertextForRecipient` using PKCS#7 logic in `proxy::pkcs7`.
+- `enclaver/src/api.rs`
+  - Internal API route implementation
 
-Ports and constants
--------------------
-- `STATUS_PORT` = 17000 (vsock) — enclave status messages.
-- `APP_LOG_PORT` = 17001 (vsock) — application logs.
-- `HTTP_EGRESS_VSOCK_PORT` = 17002 (vsock) — egress proxy port for HTTP.
-- `HTTP_EGRESS_PROXY_PORT` = 10000 (default inside enclave for egress proxying).
-- `OUTSIDE_HOST` = "host" — special hostname used inside the enclave to refer to the host (mapped to `127.0.0.1` on host side).
+- `enclaver/src/aux_api.rs`
+  - Aux API proxy and sanitization implementation
 
-Docker images and layer structure (build-time & runtime)
-------------------------------------------------------
+- `enclaver/src/encryption_key.rs`
+  - P-384 ECDH keypair management
 
-Important base images (defaults in `src/build.rs`):
-- Nitro CLI image: `public.ecr.aws/s2t1d4c6/enclaver-io/nitro-cli:latest` — provides `nitro-cli` binary and runtime libs used during EIF creation and runtime base.
-- ODYN image: `public.ecr.aws/d4t4u8d2/sparsity-ai/odyn:latest` — supervisor binary inserted into enclave image overlay.
-- Sleeve: `public.ecr.aws/d4t4u8d2/sparsity-ai/sleeve:latest` — runtime base image that receives `application.eif` and `enclaver.yaml`.
+- `enclaver/src/eth_key.rs`
+  - enclave Ethereum key management
 
-Layer sequence when building a release image:
+- `enclaver/src/eth_tx.rs`
+  - EIP-1559 transaction parsing/signing helpers
 
-1. Start from the user `app` image (`manifest.sources.app`).
-2. Append a layer that:
-   - adds `/etc/enclaver/enclaver.yaml` (manifest),
-   - copies `odyn` binary to `/sbin/odyn` (from the `odyn` source image),
-   - sets `ENTRYPOINT` to run the supervisor `/sbin/odyn --config-dir /etc/enclaver -- <app entrypoint+cmd>`.
-   Result: amended (intermediate) image.
-3. Convert amended image to an EIF: tag it temporarily and run `nitro-cli build-enclave` inside a `nitro-cli` container (this produces `application.eif`).
-4. Append a layer to the `sleeve` base image that copies:
-   - `RELEASE_BUNDLE_DIR/enclaver.yaml` (manifest),
-   - `RELEASE_BUNDLE_DIR/application.eif` (the EIF file),
-   Result: final release image containing the EIF and manifest.
+- `enclaver/src/http_util.rs`
+  - localhost HTTP server helpers
 
-Notes about Dockerfiles in `dockerfiles/`
--- `sleeve-release.dockerfile` / `sleeve-dev.dockerfile` are multi-stage Dockerfiles that extract the `nitro-cli` binary and necessary system libraries from the `nitro-cli` image and add the `enclaver-run` binary. The final runtime image entrypoint is `enclaver-run`.
-- `odyn-dev.dockerfile` and `odyn-release.dockerfile` place the `odyn` binary into `/usr/local/bin/odyn` for dev/release flows.
+- `enclaver/src/proxy/ingress.rs`
+  - host and enclave ingress proxy implementations
 
-CLI entrypoints
----------------
-- `src/bin/enclaver/main.rs` — user-facing CLI with `build` and `run` commands.
-- `src/bin/enclaver-run/main.rs` — container entrypoint that runs inside the sleeve image to orchestrate enclave creation and proxy startup.
+- `enclaver/src/proxy/egress_http.rs`
+  - host and enclave egress proxy implementations
 
-Important files to inspect quickly
----------------------------------
-- `enclaver/src/build.rs` — build pipeline and image amendment logic.
-- `enclaver/src/images.rs` — image append and tar/context builder.
-- `enclaver/src/nitro_cli_container.rs` — containerized `nitro-cli` invocation.
-- `enclaver/src/proxy/egress_http.rs` — HTTP proxying logic and CONNECT handling.
-- `enclaver/src/proxy/kms.rs` & `enclaver/src/proxy/pkcs7.rs` — KMS attestation and PKCS#7 decrypt logic.
+- `enclaver/src/policy/*`
+  - egress allow/deny rules for domain/IP matching
 
-Assumptions and notes
----------------------
-- Several modules are feature-gated (`run_enclave`, `odyn`, `proxy`, `vsock`); the repo builds different artifacts depending on feature flags.
-- The build flow uses a temporary tag workaround to avoid `nitro-cli` attempting to pull an image by name.
-- `package_eif` currently lists TODOs about file permissions and exact image layout; the current flow packages the EIF and manifest into the sleeve base image's `RELEASE_BUNDLE_DIR` (default `/enclave`).
+- `enclaver/src/integrations/nova_kms.rs`
+  - Nova KMS registry discovery, authz, node selection, end-to-end request protection
 
-Next steps & optional extras
------------------------------
-- If you'd like I can add a mermaid diagram showing module relationships and vsock flows.
-- I can also add a short `docs/README.md` with quick commands to build dev images using `scripts/build-docker-images.sh`.
+- `enclaver/src/integrations/nova_kms/app_wallet.rs`
+  - app-wallet material lifecycle in KMS KV
 
-Verification
-------------
-- This document was created by reading the implementation files under `enclaver/src` and `dockerfiles/` in the repository. It is saved to `docs/enclaver-architecture.md`.
+- `enclaver/src/integrations/s3.rs`
+  - S3-backed storage proxy with optional KMS-derived encryption
 
-References
-----------
-- Source code: `enclaver/src/*`
-- Dockerfiles & scripts: `dockerfiles/`, `scripts/build-docker-images.sh`
+- `enclaver/src/integrations/aws_util.rs`
+  - IMDS-based AWS config and credential loading via egress proxy
 
----
-Generated by code inspection on 2025-10-27.
+## Runtime order that matters
+
+### Host side (`enclaver-run`)
+
+1. load `/enclave/enclaver.yaml`
+2. start host-side egress proxy when `egress` is present
+3. start host-side clock-sync server unless `clock_sync.enabled=false`
+4. call `nitro-cli run-enclave`
+5. after enclave startup:
+   - attach debug console if requested
+   - start log stream
+   - start ingress proxies
+   - wait for status stream
+
+### Enclave side (`odyn`)
+
+1. open status and log listeners first
+2. load manifest from `/etc/enclaver/enclaver.yaml`
+3. bootstrap loopback and RNG unless `--no-bootstrap`
+4. start egress service
+5. start clock sync
+6. start Helios background tasks
+7. if registry-backed KMS is enabled, wait for Helios readiness on `18545`
+8. start Internal API and Aux API
+9. start ingress
+10. launch user process
+
+Shutdown is the reverse order of service startup.
+
+## Image and layout facts
+
+Default images from `enclaver/src/build.rs`:
+
+- Nitro CLI: `public.ecr.aws/s2t1d4c6/enclaver-io/nitro-cli:latest`
+- Odyn: `public.ecr.aws/d4t4u8d2/sparsity-ai/odyn:latest`
+- Sleeve: `public.ecr.aws/d4t4u8d2/sparsity-ai/sleeve:latest`
+
+Release image layout:
+
+```text
+Sleeve base
+|- /usr/local/bin/enclaver-run
+|- /bin/nitro-cli
+|- /enclave/enclaver.yaml
+`- /enclave/application.eif
+```
+
+Amended app image before EIF conversion:
+
+```text
+original app image
+|- /sbin/odyn
+`- /etc/enclaver/enclaver.yaml
+```
+
+## Important constants
+
+- status VSOCK port: `17000`
+- app log VSOCK port: `17001`
+- egress VSOCK port: `17002`
+- clock-sync VSOCK port: `17003`
+- default enclave egress proxy port: `10000`
+
+## Related documents
+
+- `docs/architecture.md`
+- `docs/odyn.md`
+- `docs/odyn_details.md`
+- `docs/internal_api.md`

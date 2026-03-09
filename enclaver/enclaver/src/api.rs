@@ -1,6 +1,6 @@
-use anyhow::{Result, anyhow};
-use base64::{engine::general_purpose, Engine as _};
+use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::header::CONTENT_TYPE;
@@ -9,16 +9,59 @@ use pkcs8::{DecodePublicKey, SubjectPublicKeyInfo};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crate::proxy::s3::S3Proxy;
 use crate::encryption_key::EncryptionKey;
 use crate::eth_key::EthKey;
 use crate::eth_tx::{self, AccessListEntry, TxSignature, UnsignedEip1559Tx};
 use crate::http_util::{self, HttpHandler};
+use crate::integrations::nova_kms::NovaKmsProxy;
+use crate::integrations::s3::S3Proxy;
 use crate::nsm::{AttestationParams, AttestationProvider, Nsm};
 
 const MIME_APPLICATION_CBOR: &str = "application/cbor";
+const MAX_EMPTY_RANDOM_CHUNKS: usize = 128;
+const APP_WALLET_ATTESTATION_TIMEOUT_MS: u64 = 1500;
+const MAX_API_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
+const ALLOW_WEAK_RNG_FALLBACK_ENV: &str = "ODYN_ALLOW_WEAK_RNG_FALLBACK";
+const NONCE_REPLAY_CACHE_CAPACITY: usize = 4096;
+const AES_GCM_NONCE_LEN: usize = 12;
+const LEGACY_AES_GCM_NONCE_LEN: usize = 32;
+
+struct NonceReplayCache {
+    capacity: usize,
+    order: VecDeque<[u8; 32]>,
+    seen: HashSet<[u8; 32]>,
+}
+
+impl NonceReplayCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            order: VecDeque::with_capacity(capacity),
+            seen: HashSet::with_capacity(capacity),
+        }
+    }
+
+    fn insert_if_new(&mut self, fingerprint: [u8; 32]) -> bool {
+        if self.seen.contains(&fingerprint) {
+            return false;
+        }
+        self.seen.insert(fingerprint);
+        self.order.push_back(fingerprint);
+
+        while self.order.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+
+        true
+    }
+}
 
 pub struct ApiHandler {
     attester: Box<dyn AttestationProvider + Send + Sync>,
@@ -26,20 +69,41 @@ pub struct ApiHandler {
     encryption_key: Arc<EncryptionKey>,
     nsm: Option<Arc<Nsm>>,
     s3_proxy: Option<Arc<S3Proxy>>,
+    nova_kms: Option<Arc<NovaKmsProxy>>,
+    decrypt_nonce_cache: Mutex<NonceReplayCache>,
 }
 
 impl ApiHandler {
+    fn weak_rng_fallback_enabled() -> bool {
+        match std::env::var(ALLOW_WEAK_RNG_FALLBACK_ENV) {
+            Ok(value) => matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ),
+            Err(_) => false,
+        }
+    }
+
     pub fn new(
         attester: Box<dyn AttestationProvider + Send + Sync>,
         nsm: Option<Arc<Nsm>>,
     ) -> Result<Self> {
-        Self::with_s3(attester, nsm, None)
+        Self::with_integrations(attester, nsm, None, None)
     }
 
     pub fn with_s3(
         attester: Box<dyn AttestationProvider + Send + Sync>,
         nsm: Option<Arc<Nsm>>,
         s3_proxy: Option<Arc<S3Proxy>>,
+    ) -> Result<Self> {
+        Self::with_integrations(attester, nsm, s3_proxy, None)
+    }
+
+    pub fn with_integrations(
+        attester: Box<dyn AttestationProvider + Send + Sync>,
+        nsm: Option<Arc<Nsm>>,
+        s3_proxy: Option<Arc<S3Proxy>>,
+        nova_kms: Option<Arc<NovaKmsProxy>>,
     ) -> Result<Self> {
         let eth_key = match nsm.as_ref() {
             Some(nsm_ref) => match Self::collect_random_bytes(nsm_ref, 32).and_then(|bytes| {
@@ -52,11 +116,19 @@ impl ApiHandler {
                     Arc::new(key)
                 }
                 Err(err) => {
-                    log::warn!(
-                        "Failed to derive Ethereum key from NSM RNG, falling back to OsRng: {}",
-                        err
-                    );
-                    Arc::new(EthKey::new())
+                    if Self::weak_rng_fallback_enabled() {
+                        log::warn!(
+                            "Failed to derive Ethereum key from NSM RNG; ODYN_ALLOW_WEAK_RNG_FALLBACK is enabled, falling back to OsRng: {}",
+                            err
+                        );
+                        Arc::new(EthKey::new())
+                    } else {
+                        return Err(anyhow!(
+                            "CRITICAL: Failed to derive Ethereum key from NSM RNG: {}. Refusing to start with weak entropy. Set {}=1 only for non-production fallback.",
+                            err,
+                            ALLOW_WEAK_RNG_FALLBACK_ENV
+                        ));
+                    }
                 }
             },
             None => {
@@ -68,19 +140,27 @@ impl ApiHandler {
 
         // Generate P-384 encryption key for attestation
         let encryption_key = match nsm.as_ref() {
-            Some(nsm_ref) => match Self::collect_random_bytes(nsm_ref, 32).and_then(|bytes| {
-                EncryptionKey::from_entropy(&bytes)
-            }) {
+            Some(nsm_ref) => match Self::collect_random_bytes(nsm_ref, 32)
+                .and_then(|bytes| EncryptionKey::from_entropy(&bytes))
+            {
                 Ok(key) => {
                     log::info!("Seeded P-384 encryption key from NSM RNG");
                     Arc::new(key)
                 }
                 Err(err) => {
-                    log::warn!(
-                        "Failed to derive P-384 key from NSM RNG, falling back to OsRng: {}",
-                        err
-                    );
-                    Arc::new(EncryptionKey::new())
+                    if Self::weak_rng_fallback_enabled() {
+                        log::warn!(
+                            "Failed to derive P-384 key from NSM RNG; ODYN_ALLOW_WEAK_RNG_FALLBACK is enabled, falling back to OsRng: {}",
+                            err
+                        );
+                        Arc::new(EncryptionKey::new())
+                    } else {
+                        return Err(anyhow!(
+                            "CRITICAL: Failed to derive P-384 key from NSM RNG: {}. Refusing to start with weak entropy. Set {}=1 only for non-production fallback.",
+                            err,
+                            ALLOW_WEAK_RNG_FALLBACK_ENV
+                        ));
+                    }
                 }
             },
             None => {
@@ -88,7 +168,10 @@ impl ApiHandler {
                 Arc::new(EncryptionKey::new())
             }
         };
-        log::info!("Enclave P-384 public key: {}", encryption_key.public_key_hex());
+        log::info!(
+            "Enclave P-384 public key: {}",
+            encryption_key.public_key_hex()
+        );
 
         Ok(Self {
             attester,
@@ -96,16 +179,63 @@ impl ApiHandler {
             encryption_key,
             nsm,
             s3_proxy,
+            nova_kms,
+            decrypt_nonce_cache: Mutex::new(NonceReplayCache::new(NONCE_REPLAY_CACHE_CAPACITY)),
         })
     }
 
+    fn nonce_fingerprint(client_public_key_der: &[u8], nonce: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(client_public_key_der);
+        hasher.update(nonce);
+        hasher.finalize().into()
+    }
+
+    fn register_client_nonce(&self, client_public_key_der: &[u8], nonce: &[u8]) -> bool {
+        let fingerprint = Self::nonce_fingerprint(client_public_key_der, nonce);
+        match self.decrypt_nonce_cache.lock() {
+            Ok(mut cache) => cache.insert_if_new(fingerprint),
+            Err(_) => false,
+        }
+    }
+
+    fn normalize_decrypt_nonce(raw_nonce: Vec<u8>) -> Result<(Vec<u8>, bool)> {
+        match raw_nonce.len() {
+            AES_GCM_NONCE_LEN => Ok((raw_nonce, false)),
+            LEGACY_AES_GCM_NONCE_LEN => Ok((raw_nonce[..AES_GCM_NONCE_LEN].to_vec(), true)),
+            len => bail!(
+                "Invalid nonce length: expected {} bytes (or {}-byte legacy nonce), got {}",
+                AES_GCM_NONCE_LEN,
+                LEGACY_AES_GCM_NONCE_LEN,
+                len
+            ),
+        }
+    }
+
     fn collect_random_bytes(nsm: &Arc<Nsm>, len: usize) -> Result<Vec<u8>> {
+        Self::collect_random_bytes_from_source(len, || nsm.get_random())
+    }
+
+    fn collect_random_bytes_from_source<F>(len: usize, mut next_chunk: F) -> Result<Vec<u8>>
+    where
+        F: FnMut() -> Result<Vec<u8>>,
+    {
         let mut buf = Vec::with_capacity(len);
+        let mut empty_chunks = 0usize;
         while buf.len() < len {
-            let chunk = nsm.get_random()?;
+            let chunk = next_chunk()?;
             if chunk.is_empty() {
+                empty_chunks += 1;
+                if empty_chunks >= MAX_EMPTY_RANDOM_CHUNKS {
+                    return Err(anyhow!(
+                        "NSM RNG returned empty output {} times while collecting {} bytes",
+                        MAX_EMPTY_RANDOM_CHUNKS,
+                        len
+                    ));
+                }
                 continue;
             }
+            empty_chunks = 0;
             let remaining = len - buf.len();
             if chunk.len() >= remaining {
                 buf.extend_from_slice(&chunk[..remaining]);
@@ -183,6 +313,46 @@ impl ApiHandler {
                 },
                 _ => Ok(http_util::method_not_allowed()),
             },
+            "/v1/kms/derive" => match head.method {
+                Method::POST => match &self.nova_kms {
+                    Some(proxy) => proxy.handle_derive(body).await,
+                    None => Self::kms_not_configured(),
+                },
+                _ => Ok(http_util::method_not_allowed()),
+            },
+            "/v1/kms/kv/get" => match head.method {
+                Method::POST => match &self.nova_kms {
+                    Some(proxy) => proxy.handle_kv_get(body).await,
+                    None => Self::kms_not_configured(),
+                },
+                _ => Ok(http_util::method_not_allowed()),
+            },
+            "/v1/kms/kv/put" => match head.method {
+                Method::POST => match &self.nova_kms {
+                    Some(proxy) => proxy.handle_kv_put(body).await,
+                    None => Self::kms_not_configured(),
+                },
+                _ => Ok(http_util::method_not_allowed()),
+            },
+            "/v1/kms/kv/delete" => match head.method {
+                Method::POST => match &self.nova_kms {
+                    Some(proxy) => proxy.handle_kv_delete(body).await,
+                    None => Self::kms_not_configured(),
+                },
+                _ => Ok(http_util::method_not_allowed()),
+            },
+            "/v1/app-wallet/address" => match head.method {
+                Method::GET => self.handle_app_wallet_address().await,
+                _ => Ok(http_util::method_not_allowed()),
+            },
+            "/v1/app-wallet/sign" => match head.method {
+                Method::POST => self.handle_app_wallet_sign(body).await,
+                _ => Ok(http_util::method_not_allowed()),
+            },
+            "/v1/app-wallet/sign-tx" => match head.method {
+                Method::POST => self.handle_app_wallet_sign_tx(body).await,
+                _ => Ok(http_util::method_not_allowed()),
+            },
             _ => Ok(http_util::not_found()),
         }
     }
@@ -197,10 +367,12 @@ impl ApiHandler {
             Err(err) => return Ok(http_util::bad_request(err.to_string())),
         };
 
-        let params = match attestation_req.into_params(&self.eth_key, &self.encryption_key) {
-            Ok(params) => params,
-            Err(err) => return Ok(http_util::bad_request(err.to_string())),
-        };
+        let app_wallet = self.attestation_app_wallet().await;
+        let params =
+            match attestation_req.into_params(&self.eth_key, &self.encryption_key, app_wallet) {
+                Ok(params) => params,
+                Err(err) => return Ok(http_util::bad_request(err.to_string())),
+            };
 
         let att_doc = self.attester.attestation(params)?;
 
@@ -233,7 +405,9 @@ impl ApiHandler {
 
         let msg_bytes = req.message.as_bytes();
         if msg_bytes.is_empty() {
-            return Ok(http_util::bad_request("Message cannot be empty".to_string()));
+            return Ok(http_util::bad_request(
+                "Message cannot be empty".to_string(),
+            ));
         }
 
         // Construct EIP-191 personal message prefix. The prefixed message will be hashed with keccak256 and signed.
@@ -245,11 +419,7 @@ impl ApiHandler {
         let msg_hash = eth_tx::keccak256(&prefixed_msg);
 
         let attestation = if req.include_attestation {
-            // user_data is always a JSON dict with eth_addr
-            let user_data_json = serde_json::json!({
-                "eth_addr": self.eth_key.address()
-            });
-            let user_data_bytes = serde_json::to_vec(&user_data_json)?;
+            let user_data_bytes = self.attestation_user_data_bytes(None).await?;
 
             let att_doc = self.attester.attestation(AttestationParams {
                 nonce: Some(msg_hash.to_vec()),
@@ -300,11 +470,7 @@ impl ApiHandler {
         let tx_hash = eth_tx::keccak256(&raw_tx);
 
         let attestation = if req.include_attestation {
-            // user_data is always a JSON dict with eth_addr
-            let user_data_json = serde_json::json!({
-                "eth_addr": self.eth_key.address()
-            });
-            let user_data_bytes = serde_json::to_vec(&user_data_json)?;
+            let user_data_bytes = self.attestation_user_data_bytes(None).await?;
 
             let att_doc = self.attester.attestation(AttestationParams {
                 nonce: Some(tx_hash.to_vec()),
@@ -328,6 +494,126 @@ impl ApiHandler {
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
             .body(Full::new(Bytes::from(serde_json::to_string(&response)?)))?)
+    }
+
+    async fn handle_app_wallet_address(&self) -> Result<Response<Full<Bytes>>> {
+        let proxy = match &self.nova_kms {
+            Some(proxy) => proxy,
+            None => return Self::app_wallet_not_configured(),
+        };
+
+        let authz = match proxy.ensure_app_wallet_authorized().await {
+            Ok(v) => v,
+            Err(err) => return Ok(Self::app_wallet_unavailable(err.to_string())),
+        };
+        let address = match proxy.app_wallet_address().await {
+            Ok(v) => v,
+            Err(err) => return Ok(Self::app_wallet_unavailable(err.to_string())),
+        };
+
+        let response = json::object! {
+            address: address,
+            app_id: authz.app_id,
+            instance_wallet: authz.instance_wallet,
+        };
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(json::stringify(response))))?)
+    }
+
+    async fn handle_app_wallet_sign(&self, body: Bytes) -> Result<Response<Full<Bytes>>> {
+        let proxy = match &self.nova_kms {
+            Some(proxy) => proxy,
+            None => return Self::app_wallet_not_configured(),
+        };
+
+        let req: EthSignRequest = match serde_json::from_slice(&body) {
+            Ok(req) => req,
+            Err(err) => return Ok(http_util::bad_request(err.to_string())),
+        };
+
+        let msg_bytes = req.message.as_bytes();
+        if msg_bytes.is_empty() {
+            return Ok(http_util::bad_request(
+                "Message cannot be empty".to_string(),
+            ));
+        }
+
+        let authz = match proxy.ensure_app_wallet_authorized().await {
+            Ok(v) => v,
+            Err(err) => return Ok(Self::app_wallet_unavailable(err.to_string())),
+        };
+
+        let app_wallet_key = match proxy.app_wallet_key().await {
+            Ok(v) => v,
+            Err(err) => return Ok(Self::app_wallet_unavailable(err.to_string())),
+        };
+
+        // Construct EIP-191 personal message prefix.
+        let prefix = format!("\u{0019}Ethereum Signed Message:\n{}", msg_bytes.len());
+        let mut prefixed_msg = prefix.into_bytes();
+        prefixed_msg.extend_from_slice(msg_bytes);
+        let signature = app_wallet_key.sign_message(&prefixed_msg);
+
+        let response = json::object! {
+            signature: format!("0x{}", hex::encode(signature)),
+            address: app_wallet_key.address(),
+            app_id: authz.app_id,
+        };
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(json::stringify(response))))?)
+    }
+
+    async fn handle_app_wallet_sign_tx(&self, body: Bytes) -> Result<Response<Full<Bytes>>> {
+        let proxy = match &self.nova_kms {
+            Some(proxy) => proxy,
+            None => return Self::app_wallet_not_configured(),
+        };
+
+        let req: EthSignTxRequest = match serde_json::from_slice(&body) {
+            Ok(req) => req,
+            Err(err) => return Ok(http_util::bad_request(err.to_string())),
+        };
+
+        let authz = match proxy.ensure_app_wallet_authorized().await {
+            Ok(v) => v,
+            Err(err) => return Ok(Self::app_wallet_unavailable(err.to_string())),
+        };
+
+        let unsigned_tx = match req.payload.into_unsigned_tx() {
+            Ok(tx) => tx,
+            Err(err) => return Ok(http_util::bad_request(err.to_string())),
+        };
+
+        let app_wallet_key = match proxy.app_wallet_key().await {
+            Ok(v) => v,
+            Err(err) => return Ok(Self::app_wallet_unavailable(err.to_string())),
+        };
+
+        let signable_payload = unsigned_tx.signing_payload();
+        let signature_bytes = app_wallet_key.sign_message(&signable_payload);
+        let tx_signature = match TxSignature::from_recoverable_bytes(&signature_bytes) {
+            Ok(sig) => sig,
+            Err(err) => return Ok(http_util::bad_request(err.to_string())),
+        };
+
+        let raw_tx = unsigned_tx.finalize(&tx_signature);
+        let tx_hash = eth_tx::keccak256(&raw_tx);
+
+        let response = json::object! {
+            raw_transaction: format!("0x{}", hex::encode(&raw_tx)),
+            transaction_hash: format!("0x{}", hex::encode(tx_hash)),
+            signature: format!("0x{}", hex::encode(signature_bytes)),
+            address: app_wallet_key.address(),
+            app_id: authz.app_id,
+        };
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(json::stringify(response))))?)
     }
 
     async fn handle_random(&self) -> Result<Response<Full<Bytes>>> {
@@ -356,12 +642,12 @@ impl ApiHandler {
     async fn handle_encryption_public_key(&self) -> Result<Response<Full<Bytes>>> {
         let der_bytes = self.encryption_key.public_key_as_der()?;
         let pem = self.encryption_key.public_key_as_pem()?;
-        
+
         let response = json::object! {
             public_key_der: format!("0x{}", hex::encode(&der_bytes)),
             public_key_pem: pem,
         };
-        
+
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "application/json")
@@ -369,14 +655,14 @@ impl ApiHandler {
     }
 
     /// Handle POST /v1/encryption/decrypt - decrypt data from client
-    /// 
+    ///
     /// Request body JSON:
     /// {
-    ///   "nonce": "hex-encoded nonce (at least 12 bytes)",
+    ///   "nonce": "hex-encoded nonce (12 bytes; 32-byte legacy nonce accepted)",
     ///   "client_public_key": "hex-encoded DER public key",
     ///   "encrypted_data": "hex-encoded ciphertext"
     /// }
-    /// 
+    ///
     /// Response JSON:
     /// {
     ///   "plaintext": "decrypted string"
@@ -388,29 +674,73 @@ impl ApiHandler {
         };
 
         // Decode hex inputs
-        let nonce = match hex::decode(req.nonce.strip_prefix("0x").unwrap_or(&req.nonce)) {
+        let raw_nonce = match hex::decode(req.nonce.strip_prefix("0x").unwrap_or(&req.nonce)) {
             Ok(n) => n,
             Err(e) => return Ok(http_util::bad_request(format!("Invalid nonce hex: {}", e))),
         };
-        let client_pub_key_der = match hex::decode(req.client_public_key.strip_prefix("0x").unwrap_or(&req.client_public_key)) {
-            Ok(k) => k,
-            Err(e) => return Ok(http_util::bad_request(format!("Invalid client_public_key hex: {}", e))),
+        let (nonce, used_legacy_nonce) = match Self::normalize_decrypt_nonce(raw_nonce) {
+            Ok(value) => value,
+            Err(err) => return Ok(http_util::bad_request(err.to_string())),
         };
-        let encrypted_data = match hex::decode(req.encrypted_data.strip_prefix("0x").unwrap_or(&req.encrypted_data)) {
+        if used_legacy_nonce {
+            log::warn!(
+                "Received legacy {}-byte nonce on /v1/encryption/decrypt; using first {} bytes for compatibility",
+                LEGACY_AES_GCM_NONCE_LEN,
+                AES_GCM_NONCE_LEN
+            );
+        }
+        let client_pub_key_der = match hex::decode(
+            req.client_public_key
+                .strip_prefix("0x")
+                .unwrap_or(&req.client_public_key),
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                return Ok(http_util::bad_request(format!(
+                    "Invalid client_public_key hex: {}",
+                    e
+                )));
+            }
+        };
+        let encrypted_data = match hex::decode(
+            req.encrypted_data
+                .strip_prefix("0x")
+                .unwrap_or(&req.encrypted_data),
+        ) {
             Ok(d) => d,
-            Err(e) => return Ok(http_util::bad_request(format!("Invalid encrypted_data hex: {}", e))),
+            Err(e) => {
+                return Ok(http_util::bad_request(format!(
+                    "Invalid encrypted_data hex: {}",
+                    e
+                )));
+            }
         };
 
+        if !self.register_client_nonce(&client_pub_key_der, &nonce) {
+            return Ok(http_util::bad_request(
+                "Nonce reuse detected for client_public_key".to_string(),
+            ));
+        }
+
         // Decrypt
-        let plaintext_bytes = match self.encryption_key.decrypt(&nonce, &client_pub_key_der, &encrypted_data) {
-            Ok(p) => p,
-            Err(e) => return Ok(http_util::bad_request(format!("Decryption failed: {}", e))),
-        };
+        let plaintext_bytes =
+            match self
+                .encryption_key
+                .decrypt(&nonce, &client_pub_key_der, &encrypted_data)
+            {
+                Ok(p) => p,
+                Err(e) => return Ok(http_util::bad_request(format!("Decryption failed: {}", e))),
+            };
 
         // Convert to string
         let plaintext = match String::from_utf8(plaintext_bytes) {
             Ok(s) => s,
-            Err(e) => return Ok(http_util::bad_request(format!("Invalid UTF-8 in plaintext: {}", e))),
+            Err(e) => {
+                return Ok(http_util::bad_request(format!(
+                    "Invalid UTF-8 in plaintext: {}",
+                    e
+                )));
+            }
         };
 
         let response = EncryptionDecryptResponse { plaintext };
@@ -422,13 +752,13 @@ impl ApiHandler {
     }
 
     /// Handle POST /v1/encryption/encrypt - encrypt data to client
-    /// 
+    ///
     /// Request body JSON:
     /// {
     ///   "plaintext": "string to encrypt",
     ///   "client_public_key": "hex-encoded DER public key"
     /// }
-    /// 
+    ///
     /// Response JSON:
     /// {
     ///   "encrypted_data": "hex-encoded ciphertext",
@@ -442,27 +772,40 @@ impl ApiHandler {
         };
 
         // Decode hex client public key
-        let client_pub_key_der = match hex::decode(req.client_public_key.strip_prefix("0x").unwrap_or(&req.client_public_key)) {
+        let client_pub_key_der = match hex::decode(
+            req.client_public_key
+                .strip_prefix("0x")
+                .unwrap_or(&req.client_public_key),
+        ) {
             Ok(k) => k,
-            Err(e) => return Ok(http_util::bad_request(format!("Invalid client_public_key hex: {}", e))),
+            Err(e) => {
+                return Ok(http_util::bad_request(format!(
+                    "Invalid client_public_key hex: {}",
+                    e
+                )));
+            }
         };
 
         // Generate nonce
         let nonce = if let Some(nsm) = &self.nsm {
-            Self::collect_random_bytes(nsm, 32)?
+            Self::collect_random_bytes(nsm, 12)?
         } else {
             let mut rng = rand::rngs::OsRng;
-            let mut bytes = [0u8; 32];
+            let mut bytes = [0u8; 12];
             rng.fill_bytes(&mut bytes);
             bytes.to_vec()
         };
 
         // Encrypt
         let plaintext_bytes = req.plaintext.as_bytes();
-        let encrypted_data = match self.encryption_key.encrypt(plaintext_bytes, &client_pub_key_der, &nonce) {
-            Ok(c) => c,
-            Err(e) => return Ok(http_util::bad_request(format!("Encryption failed: {}", e))),
-        };
+        let encrypted_data =
+            match self
+                .encryption_key
+                .encrypt(plaintext_bytes, &client_pub_key_der, &nonce)
+            {
+                Ok(c) => c,
+                Err(e) => return Ok(http_util::bad_request(format!("Encryption failed: {}", e))),
+            };
 
         // Get our public key
         let enclave_pub_key_der = self.encryption_key.public_key_as_der()?;
@@ -479,8 +822,78 @@ impl ApiHandler {
             .body(Full::new(Bytes::from(serde_json::to_string(&response)?)))?)
     }
 
+    async fn attestation_app_wallet(&self) -> Option<String> {
+        let proxy = match &self.nova_kms {
+            Some(proxy) => proxy,
+            None => return None,
+        };
+        if !proxy.is_app_wallet_enabled() {
+            return None;
+        }
+
+        // Attestation must stay responsive during bootstrap/registration.
+        // Resolving app wallet can involve Nova KMS network calls, so bound it tightly
+        // and fall back to attestation without app_wallet when not ready.
+        match tokio::time::timeout(
+            Duration::from_millis(APP_WALLET_ATTESTATION_TIMEOUT_MS),
+            proxy.app_wallet_address(),
+        )
+        .await
+        {
+            Ok(Ok(address)) => Some(address),
+            Ok(Err(err)) => {
+                log::warn!(
+                    "Failed to resolve app wallet for attestation user_data: {}",
+                    err
+                );
+                None
+            }
+            Err(_) => {
+                log::warn!(
+                    "Timed out resolving app wallet for attestation user_data after {}ms",
+                    APP_WALLET_ATTESTATION_TIMEOUT_MS
+                );
+                None
+            }
+        }
+    }
+
+    async fn attestation_user_data_bytes(&self, user_data: Option<Value>) -> Result<Vec<u8>> {
+        let app_wallet = self.attestation_app_wallet().await;
+        AttestationRequest::build_user_data(
+            user_data,
+            &self.eth_key.address(),
+            app_wallet.as_deref(),
+        )
+    }
+
     fn s3_not_configured() -> Result<Response<Full<Bytes>>> {
-        Ok(http_util::bad_request("S3 storage not configured".to_string()))
+        Ok(http_util::bad_request(
+            "S3 storage not configured".to_string(),
+        ))
+    }
+
+    fn app_wallet_unavailable(message: String) -> Response<Full<Bytes>> {
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("Retry-After", "10")
+            .body(Full::new(Bytes::from(format!(
+                "App wallet service unavailable: {}",
+                message
+            ))))
+            .unwrap()
+    }
+
+    fn app_wallet_not_configured() -> Result<Response<Full<Bytes>>> {
+        Ok(Self::app_wallet_unavailable(
+            "KMS integration not configured".to_string(),
+        ))
+    }
+
+    fn kms_not_configured() -> Result<Response<Full<Bytes>>> {
+        Ok(http_util::bad_request(
+            "KMS integration not configured".to_string(),
+        ))
     }
 }
 
@@ -489,6 +902,15 @@ impl HttpHandler for ApiHandler {
     async fn handle(&self, req: Request<Full<Bytes>>) -> Result<Response<Full<Bytes>>> {
         let (head, body) = req.into_parts();
         let body = body.collect().await?.to_bytes();
+        if body.len() > MAX_API_REQUEST_BODY_BYTES {
+            return Ok(Response::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .body(Full::new(Bytes::from(format!(
+                    "Request body too large: {} bytes (max {})",
+                    body.len(),
+                    MAX_API_REQUEST_BODY_BYTES
+                ))))?);
+        }
 
         self.handle_request(&head, body).await
     }
@@ -498,12 +920,20 @@ impl HttpHandler for ApiHandler {
 struct AttestationRequest {
     nonce: Option<String>,
     public_key: Option<String>,
-    user_data: Option<Value>,  // JSON object, eth_addr will be injected
+    user_data: Option<Value>, // JSON object, eth_addr/app_wallet will be injected
 }
 
 impl AttestationRequest {
-    fn into_params(self, eth_key: &EthKey, encryption_key: &EncryptionKey) -> Result<AttestationParams> {
-        let nonce = self.nonce.map(|n| general_purpose::STANDARD.decode(n)).transpose()?;
+    fn into_params(
+        self,
+        eth_key: &EthKey,
+        encryption_key: &EncryptionKey,
+        app_wallet: Option<String>,
+    ) -> Result<AttestationParams> {
+        let nonce = self
+            .nonce
+            .map(|n| general_purpose::STANDARD.decode(n))
+            .transpose()?;
 
         // Use P-384 encryption key by default, or user-provided PEM
         let public_key = match self.public_key {
@@ -511,27 +941,36 @@ impl AttestationRequest {
             None => Some(encryption_key.public_key_as_der()?),
         };
 
-        // user_data is always a JSON dict with eth_addr
-        let mut user_data_map = match self.user_data {
-            Some(Value::Object(map)) => map,
-            Some(_) => return Err(anyhow!("user_data must be a JSON object")),
-            None => serde_json::Map::new(),
-        };
-
-        // Always inject eth_addr (overwrites if user tried to set it)
-        user_data_map.insert(
-            "eth_addr".to_string(),
-            Value::String(eth_key.address()),
-        );
-
-        // Serialize to JSON bytes
-        let user_data_bytes = serde_json::to_vec(&Value::Object(user_data_map))?;
+        let user_data_bytes =
+            Self::build_user_data(self.user_data, &eth_key.address(), app_wallet.as_deref())?;
 
         Ok(AttestationParams {
             nonce,
             public_key,
             user_data: Some(user_data_bytes),
         })
+    }
+
+    fn build_user_data(
+        user_data: Option<Value>,
+        eth_addr: &str,
+        app_wallet: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        // user_data is always a JSON dict and eth_addr is always injected
+        let mut user_data_map = match user_data {
+            Some(Value::Object(map)) => map,
+            Some(_) => return Err(anyhow!("user_data must be a JSON object")),
+            None => serde_json::Map::new(),
+        };
+
+        // Always inject eth_addr (overwrites if user tried to set it)
+        user_data_map.insert("eth_addr".to_string(), Value::String(eth_addr.to_string()));
+        // App wallet is optional and only injected when KMS integration resolves it
+        if let Some(address) = app_wallet {
+            user_data_map.insert("app_wallet".to_string(), Value::String(address.to_string()));
+        }
+
+        serde_json::to_vec(&Value::Object(user_data_map)).map_err(Into::into)
     }
 }
 
@@ -720,10 +1159,100 @@ fn pem_decode(pem: &str) -> Result<Vec<u8>> {
     Ok(der.into_bytes())
 }
 
+#[test]
+fn test_attestation_build_user_data_injects_eth_and_app_wallet() {
+    use serde_json::json;
+
+    let bytes = AttestationRequest::build_user_data(
+        Some(json!({
+            "app_name": "test-app",
+            "version": "1.0",
+        })),
+        "0x1111111111111111111111111111111111111111",
+        Some("0x2222222222222222222222222222222222222222"),
+    )
+    .unwrap();
+
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(value["eth_addr"] == "0x1111111111111111111111111111111111111111");
+    assert!(value["app_wallet"] == "0x2222222222222222222222222222222222222222");
+    assert!(value["app_name"] == "test-app");
+    assert!(value["version"] == "1.0");
+}
+
+#[test]
+fn test_attestation_build_user_data_overwrites_reserved_fields() {
+    use serde_json::json;
+
+    let bytes = AttestationRequest::build_user_data(
+        Some(json!({
+            "eth_addr": "0xdeadbeef",
+            "app_wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        })),
+        "0x1111111111111111111111111111111111111111",
+        Some("0x2222222222222222222222222222222222222222"),
+    )
+    .unwrap();
+
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(value["eth_addr"] == "0x1111111111111111111111111111111111111111");
+    assert!(value["app_wallet"] == "0x2222222222222222222222222222222222222222");
+}
+
+#[test]
+fn test_attestation_build_user_data_rejects_non_object() {
+    use serde_json::json;
+
+    let result = AttestationRequest::build_user_data(
+        Some(json!(["not", "an", "object"])),
+        "0x1111111111111111111111111111111111111111",
+        None,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_attestation_build_user_data_without_app_wallet() {
+    use serde_json::json;
+
+    let bytes = AttestationRequest::build_user_data(
+        Some(json!({
+            "app_name": "test-app",
+        })),
+        "0x1111111111111111111111111111111111111111",
+        None,
+    )
+    .unwrap();
+
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(value["eth_addr"] == "0x1111111111111111111111111111111111111111");
+    assert!(value.get("app_wallet").is_none());
+    assert!(value["app_name"] == "test-app");
+}
+
+#[test]
+fn test_collect_random_bytes_from_source_collects_partial_chunks() {
+    let mut chunks = vec![Ok(vec![1u8, 2]), Ok(vec![]), Ok(vec![3, 4, 5])].into_iter();
+    let bytes = ApiHandler::collect_random_bytes_from_source(4, || chunks.next().unwrap()).unwrap();
+    assert!(bytes == vec![1u8, 2, 3, 4]);
+}
+
+#[test]
+fn test_collect_random_bytes_from_source_rejects_repeated_empty_chunks() {
+    let result = ApiHandler::collect_random_bytes_from_source(1, || Ok(Vec::new()));
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("NSM RNG returned empty output")
+    );
+}
+
 #[tokio::test]
 async fn test_attestation_handler() {
     use crate::nsm::StaticAttestationProvider;
-    use assert2::assert;
+    use base64::Engine as _;
 
     let handler =
         ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
@@ -744,7 +1273,7 @@ async fn test_attestation_handler() {
     assert!(resp.status() == StatusCode::OK);
 
     let body = json::object!(
-        nonce: base64::encode("the nonce"),
+        nonce: base64::engine::general_purpose::STANDARD.encode("the nonce"),
         user_data: json::object!(
             app_name: "test-app",
             version: "1.0"
@@ -766,7 +1295,6 @@ async fn test_attestation_handler() {
 #[tokio::test]
 async fn test_eth_address_handler() {
     use crate::nsm::StaticAttestationProvider;
-    use assert2::assert;
 
     let handler =
         ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
@@ -795,7 +1323,6 @@ async fn test_eth_address_handler() {
 #[tokio::test]
 async fn test_eth_sign_handler() {
     use crate::nsm::StaticAttestationProvider;
-    use assert2::assert;
 
     let handler =
         ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
@@ -830,7 +1357,6 @@ async fn test_eth_sign_handler() {
 #[tokio::test]
 async fn test_eth_sign_with_attestation() {
     use crate::nsm::StaticAttestationProvider;
-    use assert2::assert;
 
     let handler =
         ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
@@ -863,7 +1389,6 @@ async fn test_eth_sign_with_attestation() {
 async fn test_eth_sign_signature_recovery() {
     use crate::eth_key::EthKey;
     use crate::nsm::StaticAttestationProvider;
-    use assert2::assert;
 
     let handler =
         ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
@@ -908,7 +1433,6 @@ async fn test_eth_sign_signature_recovery() {
 #[tokio::test]
 async fn test_eth_sign_empty_message() {
     use crate::nsm::StaticAttestationProvider;
-    use assert2::assert;
 
     let handler =
         ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
@@ -927,6 +1451,159 @@ async fn test_eth_sign_empty_message() {
     let resp = handler.handle_request(&head, body).await.unwrap();
 
     assert!(resp.status() == StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_api_rejects_oversized_body() {
+    use crate::http_util::HttpHandler;
+    use crate::nsm::StaticAttestationProvider;
+
+    let handler =
+        ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
+
+    let oversized_body = vec![b'a'; MAX_API_REQUEST_BODY_BYTES + 1];
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/eth/sign")
+        .body(Full::new(Bytes::from(oversized_body)))
+        .unwrap();
+
+    let resp = handler.handle(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn test_encryption_decrypt_rejects_nonce_reuse_for_same_client_key() {
+    use crate::encryption_key::EncryptionKey;
+    use crate::nsm::StaticAttestationProvider;
+
+    let handler =
+        ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
+
+    let public_key_req = Request::builder()
+        .method("GET")
+        .uri("/v1/encryption/public_key")
+        .body(Bytes::new())
+        .unwrap();
+    let (head, body) = public_key_req.into_parts();
+    let public_key_resp = handler.handle_request(&head, body).await.unwrap();
+    assert_eq!(public_key_resp.status(), StatusCode::OK);
+    let body_bytes = public_key_resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let enclave_pub_der_hex = response_json["public_key_der"].as_str().unwrap();
+    let enclave_pub_der = hex::decode(enclave_pub_der_hex.trim_start_matches("0x")).unwrap();
+
+    let client_key = EncryptionKey::new();
+    let client_pub_der = client_key.public_key_as_der().unwrap();
+    let nonce = [0x42u8; 12];
+    let ciphertext = client_key
+        .encrypt(b"nonce-reuse-check", &enclave_pub_der, &nonce)
+        .unwrap();
+
+    let request_json = serde_json::json!({
+        "nonce": format!("0x{}", hex::encode(nonce)),
+        "client_public_key": format!("0x{}", hex::encode(&client_pub_der)),
+        "encrypted_data": format!("0x{}", hex::encode(&ciphertext)),
+    });
+    let request_body = Bytes::from(serde_json::to_vec(&request_json).unwrap());
+
+    let req_first = Request::builder()
+        .method("POST")
+        .uri("/v1/encryption/decrypt")
+        .body(request_body.clone())
+        .unwrap();
+    let (head, body) = req_first.into_parts();
+    let first_resp = handler.handle_request(&head, body).await.unwrap();
+    assert_eq!(first_resp.status(), StatusCode::OK);
+
+    let req_second = Request::builder()
+        .method("POST")
+        .uri("/v1/encryption/decrypt")
+        .body(request_body)
+        .unwrap();
+    let (head, body) = req_second.into_parts();
+    let second_resp = handler.handle_request(&head, body).await.unwrap();
+    assert_eq!(second_resp.status(), StatusCode::BAD_REQUEST);
+
+    let second_body = second_resp.into_body().collect().await.unwrap().to_bytes();
+    let second_body_text = String::from_utf8_lossy(&second_body);
+    assert!(second_body_text.contains("Nonce reuse detected"));
+}
+
+#[tokio::test]
+async fn test_encryption_decrypt_accepts_legacy_nonce_and_blocks_tail_replay_bypass() {
+    use crate::encryption_key::EncryptionKey;
+    use crate::nsm::StaticAttestationProvider;
+
+    let handler =
+        ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
+
+    let public_key_req = Request::builder()
+        .method("GET")
+        .uri("/v1/encryption/public_key")
+        .body(Bytes::new())
+        .unwrap();
+    let (head, body) = public_key_req.into_parts();
+    let public_key_resp = handler.handle_request(&head, body).await.unwrap();
+    assert_eq!(public_key_resp.status(), StatusCode::OK);
+    let body_bytes = public_key_resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let enclave_pub_der_hex = response_json["public_key_der"].as_str().unwrap();
+    let enclave_pub_der = hex::decode(enclave_pub_der_hex.trim_start_matches("0x")).unwrap();
+
+    let client_key = EncryptionKey::new();
+    let client_pub_der = client_key.public_key_as_der().unwrap();
+    let nonce_12 = [0x24u8; AES_GCM_NONCE_LEN];
+    let ciphertext = client_key
+        .encrypt(b"legacy-nonce-compatible", &enclave_pub_der, &nonce_12)
+        .unwrap();
+
+    let mut legacy_nonce_a = vec![0x11u8; LEGACY_AES_GCM_NONCE_LEN];
+    legacy_nonce_a[..AES_GCM_NONCE_LEN].copy_from_slice(&nonce_12);
+    let mut legacy_nonce_b = vec![0x22u8; LEGACY_AES_GCM_NONCE_LEN];
+    legacy_nonce_b[..AES_GCM_NONCE_LEN].copy_from_slice(&nonce_12);
+
+    let request_json_a = serde_json::json!({
+        "nonce": format!("0x{}", hex::encode(&legacy_nonce_a)),
+        "client_public_key": format!("0x{}", hex::encode(&client_pub_der)),
+        "encrypted_data": format!("0x{}", hex::encode(&ciphertext)),
+    });
+    let req_a = Request::builder()
+        .method("POST")
+        .uri("/v1/encryption/decrypt")
+        .body(Bytes::from(serde_json::to_vec(&request_json_a).unwrap()))
+        .unwrap();
+    let (head, body) = req_a.into_parts();
+    let resp_a = handler.handle_request(&head, body).await.unwrap();
+    assert_eq!(resp_a.status(), StatusCode::OK);
+
+    let request_json_b = serde_json::json!({
+        "nonce": format!("0x{}", hex::encode(&legacy_nonce_b)),
+        "client_public_key": format!("0x{}", hex::encode(&client_pub_der)),
+        "encrypted_data": format!("0x{}", hex::encode(&ciphertext)),
+    });
+    let req_b = Request::builder()
+        .method("POST")
+        .uri("/v1/encryption/decrypt")
+        .body(Bytes::from(serde_json::to_vec(&request_json_b).unwrap()))
+        .unwrap();
+    let (head, body) = req_b.into_parts();
+    let resp_b = handler.handle_request(&head, body).await.unwrap();
+    assert_eq!(resp_b.status(), StatusCode::BAD_REQUEST);
+
+    let resp_b_body = resp_b.into_body().collect().await.unwrap().to_bytes();
+    let resp_b_text = String::from_utf8_lossy(&resp_b_body);
+    assert!(resp_b_text.contains("Nonce reuse detected"));
 }
 
 #[cfg(test)]
@@ -956,7 +1633,6 @@ fn sample_unsigned_tx_for_tests() -> UnsignedEip1559Tx {
 #[tokio::test]
 async fn test_eth_sign_tx_structured() {
     use crate::nsm::StaticAttestationProvider;
-    use assert2::assert;
 
     let handler =
         ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
@@ -1008,7 +1684,6 @@ async fn test_eth_sign_tx_structured() {
 #[tokio::test]
 async fn test_eth_sign_tx_raw_payload() {
     use crate::nsm::StaticAttestationProvider;
-    use assert2::assert;
 
     let handler =
         ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
@@ -1048,7 +1723,6 @@ async fn test_eth_sign_tx_raw_payload() {
 #[tokio::test]
 async fn test_eth_sign_tx_signature_verification() {
     use crate::nsm::StaticAttestationProvider;
-    use assert2::assert;
 
     let handler =
         ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
@@ -1183,7 +1857,6 @@ async fn test_eth_sign_tx_signature_verification() {
 #[tokio::test]
 async fn test_random_handler() {
     use crate::nsm::StaticAttestationProvider;
-    use assert2::assert;
 
     let handler =
         ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
@@ -1215,4 +1888,63 @@ async fn test_random_handler() {
 
     // Verify it's valid hex
     assert!(hex::decode(random_bytes_str.trim_start_matches("0x")).is_ok());
+}
+
+#[tokio::test]
+async fn test_s3_get_without_s3_integration() {
+    use crate::nsm::StaticAttestationProvider;
+
+    let handler =
+        ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
+
+    let body = json::object! {
+        key: "config.json",
+    };
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/s3/get")
+        .body(Bytes::from(json::stringify(body)))
+        .unwrap();
+    let (head, body) = req.into_parts();
+    let resp = handler.handle_request(&head, body).await.unwrap();
+    assert!(resp.status() == StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_kms_derive_without_kms_integration() {
+    use crate::nsm::StaticAttestationProvider;
+
+    let handler =
+        ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
+
+    let body = json::object! {
+        path: "s3/v1/config",
+        context: "",
+        length: 32,
+    };
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/kms/derive")
+        .body(Bytes::from(json::stringify(body)))
+        .unwrap();
+    let (head, body) = req.into_parts();
+    let resp = handler.handle_request(&head, body).await.unwrap();
+    assert!(resp.status() == StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_app_wallet_address_without_kms_integration() {
+    use crate::nsm::StaticAttestationProvider;
+
+    let handler =
+        ApiHandler::new(Box::new(StaticAttestationProvider::new(Vec::new())), None).unwrap();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/app-wallet/address")
+        .body(Bytes::new())
+        .unwrap();
+    let (head, body) = req.into_parts();
+    let resp = handler.handle_request(&head, body).await.unwrap();
+    assert!(resp.status() == StatusCode::SERVICE_UNAVAILABLE);
 }

@@ -49,6 +49,8 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
     error InvalidVersionName();
     error InvalidImageUri();
     error AppNotActive();
+    error InvalidAppWalletAddress();
+    error AppWalletMismatch();
 
     // ========== Enums ==========
 
@@ -85,6 +87,7 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         uint256 latestVersionId;
         uint256 createdAt;
         AppStatus status;
+        address appWallet;
     }
 
     /// @dev Version entity - represents a specific build/code measurement
@@ -177,6 +180,7 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         address dappContract,
         string metadataUri
     );
+    event AppWalletSet(uint256 indexed appId, address indexed appWallet);
 
     event VersionEnrolled(
         uint256 indexed appId,
@@ -289,7 +293,8 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
             metadataUri: metadataUri,
             latestVersionId: 0,
             createdAt: block.timestamp,
-            status: AppStatus.ACTIVE
+            status: AppStatus.ACTIVE,
+            appWallet: address(0)
         });
 
         ownerApps[msg.sender].push(appId);
@@ -554,6 +559,22 @@ contract NovaAppRegistry is Initializable, OwnableUpgradeable, UUPSUpgradeable {
         }
 
         emit InstanceStatusChanged(instanceId, newStatus);
+    }
+
+    /// @notice Anchors app-level wallet once.
+    /// @dev Only app owner can call this method and only when app wallet is still unset.
+    function setAppWalletIfUnset(
+        uint256 appId,
+        address appWallet
+    ) external {
+        App storage app = apps[appId];
+        if (app.owner != msg.sender) revert NotAppOwner();
+        if (app.appWallet != address(0)) revert AppWalletMismatch();
+
+        if (appWallet == address(0)) revert InvalidAppWalletAddress();
+
+        app.appWallet = appWallet;
+        emit AppWalletSet(appId, appWallet);
     }
 
     // ========== View Functions ==========

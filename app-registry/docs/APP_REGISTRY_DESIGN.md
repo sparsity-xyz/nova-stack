@@ -10,7 +10,7 @@ The registry organizes data in a strict three-layer hierarchy:
 
 1.  **Application (App)**
     *   **Definition**: Represents the abstract identity of a dApp or service.
-    *   **Key Data**: `AppID`, `Owner`, `TEE Architecture`, `Metadata URI`, `Status`.
+    *   **Key Data**: `AppID`, `Owner`, `TEE Architecture`, `Metadata URI`, `Status`, `appWallet`.
     *   **Role**: Acts as the container for all versions and configuration.
     *   **Status**:
         *   `ACTIVE`: The application is fully functional.
@@ -76,6 +76,19 @@ Once the measurement is enrolled, operators can deploy instances.
     *   **Logic**: The Registry compares the proven PCRs from the live instance against the Enrolled Measurement.
     *   **Result**: If they match, the instance is registered as an **Attested Runtime Instance**. Its TEE Public Key is now trusted.
 
+### 2.3 App-Wallet Anchoring & Consistency
+
+`registerInstance` does not accept app-wallet arguments.
+
+App wallet anchoring is an explicit one-time call:
+- `setAppWalletIfUnset(appId, appWallet)`
+
+Rules:
+1. Only the app owner can call `setAppWalletIfUnset`.
+2. `appWallet` must be non-zero.
+3. If `appWallet` is already set, the call reverts with `AppWalletMismatch`.
+4. No proof or deadline is required.
+
 ---
 
 ## 3. Integration
@@ -91,3 +104,12 @@ Developers building on Nova can act on `registerInstance` events or implement th
 Users can verify the security of an application by looking up its `AppID` on the Registry. If an instance is listed with `zkVerified = true`, it guarantees:
 1.  The code running in that enclave matches the open-source code enrolled by the App Owner.
 2.  The TEE Public Key belongs to that specific secure enclosure and cannot be accessed by the node operator.
+
+Common read APIs used by platform components:
+- `getApp(appId)` (includes `appWallet`)
+- `getInstanceByWallet(teeWalletAddress)`
+- `getActiveInstances(appId)`
+
+Control-plane implementation note:
+- Keep a single shared ABI definition for these methods (do not maintain duplicate ABI snippets per endpoint).
+- Async HTTP handlers that call `web3.py` should offload synchronous RPC calls to worker threads to avoid event-loop stalls.

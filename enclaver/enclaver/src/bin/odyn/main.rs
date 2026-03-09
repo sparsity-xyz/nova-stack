@@ -2,16 +2,16 @@
 
 pub mod api;
 pub mod aux_api;
+pub mod clock_sync;
 pub mod config;
 pub mod console;
 pub mod egress;
 pub mod enclave;
 pub mod helios_rpc;
 pub mod ingress;
-pub mod kms_proxy;
 pub mod launcher;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use log::{error, info};
 use std::ffi::OsString;
@@ -23,12 +23,14 @@ use enclaver::nsm::Nsm;
 
 use api::ApiService;
 use aux_api::AuxApiService;
+use clock_sync::ClockSyncService;
 use config::Configuration;
 use console::{AppLog, AppStatus};
 use egress::EgressService;
 use helios_rpc::HeliosRpcService;
 use ingress::IngressService;
-use kms_proxy::KmsProxyService;
+
+const KMS_AUTH_CHAIN_HELIOS_PORT: u16 = 18545;
 
 #[derive(Parser)]
 struct CliArgs {
@@ -63,11 +65,29 @@ async fn launch(args: &CliArgs) -> Result<launcher::ExitStatus> {
 
     let egress = EgressService::start(&config).await?;
 
-    // Start Helios in background (non-blocking, app starts immediately)
-    let helios_rpc = HeliosRpcService::start(&config).await?;
+    // Start clock sync service. It is enabled by default unless disabled in the manifest.
+    let clock_sync = ClockSyncService::start(&config);
 
-    let (kms_proxy, api, aux_api) = tokio::try_join!(
-        KmsProxyService::start(config.clone(), nsm.clone()),
+    // Start Helios in background (non-blocking, app starts immediately)
+    let mut helios_rpc = HeliosRpcService::start(&config).await?;
+    if config
+        .kms_integration_config()
+        .map(|kms| kms.registry_discovery_configured())
+        .unwrap_or(false)
+    {
+        info!("Waiting for Helios auth-chain RPC readiness required by Nova KMS");
+        if !helios_rpc
+            .wait_ready_for_port(KMS_AUTH_CHAIN_HELIOS_PORT)
+            .await
+        {
+            return Err(anyhow!(
+                "Helios auth-chain RPC failed to become ready on local port {}",
+                KMS_AUTH_CHAIN_HELIOS_PORT
+            ));
+        }
+    }
+
+    let (api, aux_api) = tokio::try_join!(
         ApiService::start(&config, nsm.clone()),
         AuxApiService::start(&config),
     )?;
@@ -84,7 +104,7 @@ async fn launch(args: &CliArgs) -> Result<launcher::ExitStatus> {
 
     aux_api.stop().await;
     api.stop().await;
-    kms_proxy.stop().await;
+    clock_sync.stop().await;
     helios_rpc.stop().await;
     ingress.stop().await;
     egress.stop().await;

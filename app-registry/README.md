@@ -32,6 +32,8 @@ The registry is the source of truth for TEE apps, managing:
 
 *   **3-Layer Hierarchy**: `App` (Identity) -> `Version` (Code) -> `Instance` (Runtime).
 *   **TEE Verification**: Integrates with `NitroEnclaveVerifier` to validate ZK proofs from AWS Nitro Enclaves.
+*   **App-Wallet Anchoring**: Supports app-level persistent identity via `appWallet` with ownership proof checks during `registerInstance`.
+*   **Control-Plane Friendly**: Designed for shared ABI consumption (`NOVA_REGISTRY_ABI`) across Nova control-plane services and proxy verification paths.
 *   **Upgradeable**: Uses the UUPS proxy pattern for future-proof improvements.
 *   **Gas Optimized**: Efficient storage packing and optimized validation logic.
 *   **Secure Deployment Pipeline**:
