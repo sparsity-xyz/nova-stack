@@ -11,7 +11,7 @@ Odyn is the supervisor process that runs inside the AWS Nitro Enclave. It acts a
 1. **Bootstrapping the enclave environment** — Setting up networking and secure random number generation
 2. **Launching your application** — Starting and supervising your application process
 3. **Providing platform services** — Attestation, signing, encryption, storage, and KMS/app-wallet routes via the Internal API
-4. **Managing runtime plumbing** — Ingress, egress, clock sync, and optional Helios RPC
+4. **Managing runtime plumbing** — Host-backed mounts, ingress, egress, clock sync, and optional Helios RPC
 5. **Streaming logs and status** — Making application logs available to the host
 
 ```text
@@ -54,9 +54,11 @@ sequenceDiagram
     participant Enclave
     participant Odyn
     participant App as Your Application
+    participant HostFs as Host-backed Storage
 
     Enclave->>Odyn: Start (as PID 1)
     Odyn->>Odyn: Bootstrap (loopback, RNG seed)
+    Odyn->>HostFs: Mount host-backed directories (if configured)
     Odyn->>Odyn: Start Egress Proxy (if configured)
     Odyn->>Odyn: Start Clock Sync (default; unless disabled)
     Odyn->>Odyn: Start Helios RPC (if configured)
@@ -94,7 +96,7 @@ Odyn automatically sets the following environment variables for your application
 > # Set to false in your base Dockerfile
 > ENV IN_ENCLAVE=false
 > ```
-> Then in your application's layer (added during `enclaver build`), this can be overridden. Or, your application can detect the enclave environment by checking if the Odyn API is available at `http://127.0.0.1:<api_port>/v1/eth/address`.
+> Enclaver does not set or override `IN_ENCLAVE` for you. If you want this convention, set it in your own image variants or entrypoint wrapper. Otherwise, detect the enclave environment by checking whether the Odyn API is available at `http://127.0.0.1:<api_port>/v1/eth/address`.
 
 ---
 
@@ -102,7 +104,7 @@ Odyn automatically sets the following environment variables for your application
 
 Odyn consists of several configurable modules, each providing specific functionality:
 
-Standalone runtime services include ingress, egress, clock sync, console/log streaming, and optional Helios RPC. Encryption, storage, and KMS/app-wallet features are exposed through the Internal API rather than running as peer daemons.
+Standalone runtime services include host-backed mounts, ingress, egress, clock sync, console/log streaming, and optional Helios RPC. Encryption, storage, and KMS/app-wallet features are exposed through the Internal API rather than running as peer daemons.
 
 ### 1. Ingress Proxy
 
@@ -142,12 +144,12 @@ egress:
   allow:
     - "api.example.com"      # Exact domain
     - "*.amazonaws.com"      # Wildcard subdomain
-    - "169.254.169.254"      # IMDS (required for KMS)
+    - "169.254.169.254"      # IMDS (needed for AWS SDK / S3 region+credential discovery)
   deny:
     - "*.internal.com"       # Block specific patterns
 ```
 
-**For your app**: Most HTTP libraries automatically use `http_proxy`/`https_proxy` environment variables. No code changes needed.
+**For your app**: If your HTTP client honors `http_proxy`/`https_proxy`, no extra code is needed. Otherwise configure the proxy explicitly. The repo's `examples/hn-fetcher/app.js` shows one pattern that reads `HTTPS_PROXY` and constructs a proxy-aware agent.
 
 ---
 
@@ -285,7 +287,56 @@ storage:
 
 ---
 
-### 7. Console & Log Streaming
+### 7. Host-Backed Directory Mounts
+
+**Purpose**: Gives your application a normal directory inside the enclave whose data is backed by the parent instance. Reusing the same host state directory preserves contents across enclave restarts; discarding it makes the mount behave like a host-backed temporary directory.
+
+**How it works**:
+- `enclaver run --mount <name>=<host_state_dir>` prepares or reuses a fixed-size loopback image on the host
+- `enclaver-run` exposes that filesystem through a hostfs file proxy on a host-side VSOCK port derived from the enclave CID and mount order
+- Odyn mounts a FUSE filesystem at the configured `mount_path` before your app starts. `mount_path` must live under `/mnt/...`
+- Your application uses ordinary file APIs against that mount path
+
+**Actual host layout**:
+- `<host_state_dir>` is the per-mount state directory you bind at runtime
+- Enclaver stores its hostfs metadata under `<host_state_dir>/.enclaver-hostfs/`
+- The durable backing image is `<host_state_dir>/.enclaver-hostfs/disk.img`
+- The runtime lock file is `<host_state_dir>/.enclaver-hostfs/lock`
+- The transient host mountpoint is created as `<host_state_dir>/.enclaver-hostfs/mnt-<uuid>/data`
+
+Example:
+```text
+/var/lib/my-service/appdata/
+`- .enclaver-hostfs/
+   |- disk.img
+   |- lock
+   `- mnt-<uuid>/
+      `- data/
+```
+
+The extra `.enclaver-hostfs/` layer is intentional: it keeps Enclaver runtime
+metadata separate from the application-visible host state directory.
+
+**Configuration**:
+```yaml
+storage:
+  mounts:
+    - name: appdata
+      mount_path: /mnt/appdata
+      required: true
+      size_mb: 10240
+```
+
+Run-time binding:
+```bash
+enclaver run -f enclaver.yaml --mount appdata=/var/lib/my-service/appdata
+```
+
+**For your app**: Read and write `/mnt/appdata` using normal filesystem calls. Required mounts block startup if they cannot be mounted.
+
+---
+
+### 8. Console & Log Streaming
 
 **Purpose**: Captures your application's stdout/stderr and streams it to the host.
 
@@ -336,7 +387,7 @@ clock_sync:
 api:
   listen_port: 18000
 
-# Aux API port override (the service also starts by default when API is enabled)
+# Aux API port override (the service is required whenever API is enabled)
 aux_api:
   listen_port: 18001
 
@@ -370,6 +421,11 @@ storage:
     enabled: true
     bucket: "my-app-data"
     prefix: "apps/my-service/"
+  mounts:
+    - name: "appdata"
+      mount_path: "/mnt/appdata"
+      required: true
+      size_mb: 10240
 ```
 
 ---
@@ -379,11 +435,12 @@ storage:
 | Module | Port Config | Purpose | Your App Usage |
 |--------|-------------|---------|----------------|
 | **Ingress** | `ingress[].listen_port` | Accept external connections | Bind to `127.0.0.1:<port>` |
-| **Egress** | `egress.proxy_port` | Make outbound HTTP requests | Automatic via `http_proxy` env var |
+| **Egress** | `egress.proxy_port` | Make outbound HTTP requests | Use a proxy-aware HTTP client or explicit proxy config |
 | **Clock Sync** | `clock_sync.interval_secs` / `clock_sync.enabled` | Keep enclave wall clock aligned with host time | Automatic; no app changes |
 | **Internal API** | `api.listen_port` | Attestation, signing, encryption, KMS/app-wallet, storage | HTTP to `http://127.0.0.1:<port>` |
-| **Aux API** | `aux_api.listen_port` | Restricted API for sidecars; defaults to `api_port + 1` | HTTP to `http://127.0.0.1:<port>` |
+| **Aux API** | `aux_api.listen_port` | Restricted API for sidecars and attestation; defaults to `api_port + 1` | HTTP to `http://127.0.0.1:<port>` |
 | **Storage** | `storage.s3.*` | Persistent S3 storage exposed via the Internal API | HTTP to `/v1/s3/...` |
+| **Host-Backed Mounts** | `storage.mounts[]` + runtime `--mount` | Writable enclave directories backed by host loopback images | Normal file APIs under `/mnt/...` |
 | **Helios RPC** | `helios_rpc.chains[].local_rpc_port` | Trustless multi-chain RPC | HTTP to `http://127.0.0.1:<chain_port>` |
 | **Console** | N/A (automatic) | Log streaming | Print to stdout/stderr |
 

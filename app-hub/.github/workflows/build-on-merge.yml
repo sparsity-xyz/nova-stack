@@ -37,7 +37,7 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 2
       
@@ -114,7 +114,26 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+      
+      # Callback to Nova Platform when build starts (optional - does not fail the build)
+      - name: Callback to Nova Platform (Started)
+        if: github.event.inputs.app_sqid != '' && github.event.inputs.build_id != ''
+        continue-on-error: true
+        run: |
+          echo "Sending started callback to Nova Platform..."
+          API_URL="${NOVA_PLATFORM_API_URL%/}"  # Strip trailing slash if present
+          curl -X POST "${API_URL}/api/builds/callback" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.NOVA_PLATFORM_CALLBACK_API_KEY }}" \
+            -d '{
+              "app_sqid": "${{ github.event.inputs.app_sqid }}",
+              "build_id": ${{ github.event.inputs.build_id }},
+              "status": "started",
+              "github_run_id": "${{ github.run_id }}"
+            }' || echo "Callback failed, but continuing..."
+        env:
+          NOVA_PLATFORM_API_URL: ${{ secrets.NOVA_PLATFORM_API_URL }}
       
       - name: Install yq
         run: |
@@ -225,17 +244,27 @@ jobs:
           echo "epoch=$EPOCH" >> $GITHUB_OUTPUT
       
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       
+      - name: Check Docker Hub credentials
+        id: dockerhub_creds
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::DOCKERHUB_USERNAME and DOCKERHUB_TOKEN are not configured. The custom Enclaver docker-dir path does not require them, but app Dockerfiles that pull from Docker Hub may still benefit from authenticated access."
+          fi
+
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        if: steps.dockerhub_creds.outputs.available == 'true'
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-        continue-on-error: true  # Continue even if Docker Hub login fails
       
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -322,12 +351,21 @@ jobs:
       - name: Install Enclaver CLI
         run: |
           echo "Installing Enclaver CLI..."
-          
+
           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/sparsity-xyz/enclaver/refs/heads/sparsity/install.sh)"
-          
+
           enclaver --version
           echo "✅ Enclaver CLI installed successfully"
-      
+
+      - name: Require Docker Hub auth for Enclaver build
+        if: steps.dockerhub_creds.outputs.available != 'true'
+        run: |
+          echo "ERROR: DOCKERHUB_USERNAME and DOCKERHUB_TOKEN must be configured for the Enclaver build stage."
+          echo "The current Enclaver/Nitro CLI path may trigger Docker Hub pulls for temporary image tags on GitHub-hosted runners."
+          echo "Configure those secrets and rerun this workflow."
+          echo "Reference: docs/nova-app-hub.md"
+          exit 1
+
       - name: Prepare enclaver.yaml
         id: enclaver_config
         run: |
@@ -360,14 +398,6 @@ jobs:
           
           echo "release_image=${RELEASE_IMAGE}" >> $GITHUB_OUTPUT
           echo "ecr_image=${ECR_IMAGE}" >> $GITHUB_OUTPUT
-      
-      - name: Pre-pull required images for Enclaver
-        run: |
-          echo "Pre-pulling required Docker images..."
-          docker pull public.ecr.aws/d4t4u8d2/sparsity-ai/odyn:latest
-          docker pull public.ecr.aws/d4t4u8d2/sparsity-ai/sleeve:latest
-          docker pull public.ecr.aws/s2t1d4c6/enclaver-io/nitro-cli:latest
-          echo "✅ Required images pre-pulled successfully"
       
       - name: Build Enclaver release image
         id: enclaver
@@ -621,115 +651,134 @@ jobs:
           echo "  Certificate: s3://${{ env.S3_BUCKET }}/builds/${APP_NAME}/${VERSION}/build-attestation.json.crt"
       
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ steps.config.outputs.name }}-v${{ steps.config.outputs.version }}
-          name: "${{ steps.config.outputs.name }} v${{ steps.config.outputs.version }}"
-          body: |
-            ## AWS Nitro Enclave Build (via Enclaver)
-            
-            - **Application**: ${{ steps.config.outputs.name }}
-            - **Version**: ${{ steps.config.outputs.version }}
-            - **Build Time**: ${{ steps.attestation.outputs.build_timestamp }}
-            - **Workflow Run Number**: ${{ github.run_number }}
-            
-            ## Source
-            
-            - **Repository**: ${{ steps.config.outputs.repo }}
-            - **Ref**: ${{ steps.config.outputs.ref }}
-            - **Commit**: `${{ steps.clone.outputs.commit_sha }}`
-            - **Commit Message**: ${{ steps.clone.outputs.commit_message }}
-            - **Directory**: `${{ steps.config.outputs.directory }}`
-            - **Dockerfile**: `${{ steps.config.outputs.dockerfile }}`
-            - **SOURCE_DATE_EPOCH**: `${{ steps.epoch.outputs.epoch }}`
-            
-            ## PCR Values (Platform Configuration Registers)
-            
-            These values can be used for remote attestation to verify the enclave identity.
-            
-            | PCR | Value |
-            |-----|-------|
-            | **PCR0** | `${{ steps.enclaver.outputs.pcr0 }}` |
-            | **PCR1** | `${{ steps.enclaver.outputs.pcr1 }}` |
-            | **PCR2** | `${{ steps.enclaver.outputs.pcr2 }}` |
-            
-            ## Release Docker Image
-            
-            The release image contains the EIF and Enclaver runtime:
-            
-            ```
-            ${{ steps.enclaver.outputs.release_image }}
-            ```
-            
-            **Digest**: `${{ steps.enclaver.outputs.digest }}`
-            
-            ## Build Attestation
-            
-            | Property | Value |
-            |----------|-------|
-            | **File** | [build-attestation.json](https://github.com/${{ github.repository }}/releases/download/${{ steps.config.outputs.name }}-v${{ steps.config.outputs.version }}/build-attestation.json) |
-            | **SHA256** | `${{ steps.attestation.outputs.build_attestation_sha256 }}` |
-            
-            ## SLSA Provenance & Signature Verification
-            
-            This image and build attestation are signed using [Sigstore cosign](https://sigstore.dev) with keyless signing.
-            
-            - **Image Rekor Log Index**: [`${{ steps.sign.outputs.rekor_index }}`](https://search.sigstore.dev/?logIndex=${{ steps.sign.outputs.rekor_index }})
-            - **Attestation Rekor Log Index**: [`${{ steps.sign_attestation.outputs.attestation_rekor_index }}`](https://search.sigstore.dev/?logIndex=${{ steps.sign_attestation.outputs.attestation_rekor_index }})
-            
-            ### Verify Container Image Signature
-            
-            ```bash
-            cosign verify \
-              --certificate-identity-regexp='https://github.com/${{ github.repository }}/.*' \
-              --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-              ${{ steps.enclaver.outputs.release_image }}@${{ steps.enclaver.outputs.digest }}
-            ```
-            
-            ### Verify Build Attestation Signature
-            
-            ```bash
-            # Download attestation files
-            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.config.outputs.name }}-v${{ steps.config.outputs.version }}/build-attestation.json
-            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.config.outputs.name }}-v${{ steps.config.outputs.version }}/build-attestation.json.sig
-            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.config.outputs.name }}-v${{ steps.config.outputs.version }}/build-attestation.json.crt
-            
-            # Verify signature
-            cosign verify-blob \
-              --signature build-attestation.json.sig \
-              --certificate build-attestation.json.crt \
-              --certificate-identity-regexp='https://github.com/${{ github.repository }}/.*' \
-              --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
-              build-attestation.json
-            ```
-            
-            ## Usage
-            
-            Run on an EC2 instance with Nitro Enclave support:
-            
-            ```bash
-            docker pull ${{ steps.enclaver.outputs.release_image }}
-            docker run --rm --privileged ${{ steps.enclaver.outputs.release_image }}
-            ```
-            
-            ## Verification
-            
-            To verify this build:
-            
-            1. Check the [GitHub Actions run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
-            2. Verify PCR values match the expected values for your attestation policy
-            3. Verify the container image signature using cosign
-            4. Verify the build attestation signature using cosign
-          draft: false
-          prerelease: false
-          files: |
-            output/build-attestation.json
-            output/build-attestation.json.sig
-            output/build-attestation.json.crt
-            output/pcr.json
-            output/enclaver.yaml
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.config.outputs.name }}-v${{ steps.config.outputs.version }}"
+          NAME="${{ steps.config.outputs.name }} v${{ steps.config.outputs.version }}"
+
+          tee release-notes.md > /dev/null <<'EOF'
+          ## AWS Nitro Enclave Build (via Enclaver)
+          
+          - **Application**: ${{ steps.config.outputs.name }}
+          - **Version**: ${{ steps.config.outputs.version }}
+          - **Build Time**: ${{ steps.attestation.outputs.build_timestamp }}
+          - **Workflow Run Number**: ${{ github.run_number }}
+          
+          ## Source
+          
+          - **Repository**: ${{ steps.config.outputs.repo }}
+          - **Ref**: ${{ steps.config.outputs.ref }}
+          - **Commit**: `${{ steps.clone.outputs.commit_sha }}`
+          - **Commit Message**: ${{ steps.clone.outputs.commit_message }}
+          - **Directory**: `${{ steps.config.outputs.directory }}`
+          - **Dockerfile**: `${{ steps.config.outputs.dockerfile }}`
+          - **SOURCE_DATE_EPOCH**: `${{ steps.epoch.outputs.epoch }}`
+          
+          ## PCR Values (Platform Configuration Registers)
+          
+          These values can be used for remote attestation to verify the enclave identity.
+          
+          | PCR | Value |
+          |-----|-------|
+          | **PCR0** | `${{ steps.enclaver.outputs.pcr0 }}` |
+          | **PCR1** | `${{ steps.enclaver.outputs.pcr1 }}` |
+          | **PCR2** | `${{ steps.enclaver.outputs.pcr2 }}` |
+          
+          ## Release Docker Image
+          
+          The release image contains the EIF and Enclaver runtime:
+          
+          ```
+          ${{ steps.enclaver.outputs.release_image }}
+          ```
+          
+          **Digest**: `${{ steps.enclaver.outputs.digest }}`
+          
+          ## Build Attestation
+          
+          | Property | Value |
+          |----------|-------|
+          | **File** | [build-attestation.json](https://github.com/${{ github.repository }}/releases/download/${{ steps.config.outputs.name }}-v${{ steps.config.outputs.version }}/build-attestation.json) |
+          | **SHA256** | `${{ steps.attestation.outputs.build_attestation_sha256 }}` |
+          
+          ## SLSA Provenance & Signature Verification
+          
+          This image and build attestation are signed using [Sigstore cosign](https://sigstore.dev) with keyless signing.
+          
+          - **Image Rekor Log Index**: [`${{ steps.sign.outputs.rekor_index }}`](https://search.sigstore.dev/?logIndex=${{ steps.sign.outputs.rekor_index }})
+          - **Attestation Rekor Log Index**: [`${{ steps.sign_attestation.outputs.attestation_rekor_index }}`](https://search.sigstore.dev/?logIndex=${{ steps.sign_attestation.outputs.attestation_rekor_index }})
+          
+          ### Verify Container Image Signature
+          
+          ```bash
+          cosign verify \
+            --certificate-identity-regexp='https://github.com/${{ github.repository }}/.*' \
+            --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
+            ${{ steps.enclaver.outputs.release_image }}@${{ steps.enclaver.outputs.digest }}
+          ```
+          
+          ### Verify Build Attestation Signature
+          
+          ```bash
+          # Download attestation files
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.config.outputs.name }}-v${{ steps.config.outputs.version }}/build-attestation.json
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.config.outputs.name }}-v${{ steps.config.outputs.version }}/build-attestation.json.sig
+          curl -LO https://github.com/${{ github.repository }}/releases/download/${{ steps.config.outputs.name }}-v${{ steps.config.outputs.version }}/build-attestation.json.crt
+          
+          # Verify signature
+          cosign verify-blob \
+            --signature build-attestation.json.sig \
+            --certificate build-attestation.json.crt \
+            --certificate-identity-regexp='https://github.com/${{ github.repository }}/.*' \
+            --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
+            build-attestation.json
+          ```
+          
+          ## Usage
+          
+          Run on an EC2 instance with Nitro Enclave support:
+          
+          ```bash
+          docker pull ${{ steps.enclaver.outputs.release_image }}
+          docker run --rm --privileged ${{ steps.enclaver.outputs.release_image }}
+          ```
+          
+          ## Verification
+          
+          To verify this build:
+          
+          1. Check the [GitHub Actions run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          2. Verify PCR values match the expected values for your attestation policy
+          3. Verify the container image signature using cosign
+          4. Verify the build attestation signature using cosign
+          EOF
+
+          if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "${{ github.repository }}" \
+              --draft=false \
+              --prerelease=false \
+              --title "$NAME" \
+              --notes-file release-notes.md
+          else
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --target "$GITHUB_SHA" \
+              --title "$NAME" \
+              --notes-file release-notes.md
+          fi
+
+          gh release upload "$TAG" \
+            output/build-attestation.json \
+            output/build-attestation.json.sig \
+            output/build-attestation.json.crt \
+            output/pcr.json \
+            output/enclaver.yaml \
+            --repo "${{ github.repository }}" \
+            --clobber
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Summary
         run: |

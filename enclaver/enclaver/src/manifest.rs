@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use crate::constants::KMS_REGISTRY_HELIOS_PORT;
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -23,7 +24,6 @@ pub struct Manifest {
     pub defaults: Option<Defaults>,
     pub api: Option<Api>,
     pub aux_api: Option<AuxApi>,
-    pub vsock_ports: Option<VsockPorts>,
     pub storage: Option<Storage>,
     pub kms_integration: Option<KmsIntegration>,
     pub helios_rpc: Option<HeliosRpc>,
@@ -34,9 +34,30 @@ impl Manifest {
     pub fn effective_clock_sync(&self) -> ClockSync {
         self.clock_sync.clone().unwrap_or_default()
     }
-}
 
-const KMS_REGISTRY_HELIOS_PORT: u16 = 18545;
+    pub fn hostfs_mounts(&self) -> Option<&[HostFsMountConfig]> {
+        self.storage
+            .as_ref()
+            .and_then(|storage| storage.mounts.as_deref())
+    }
+
+    pub fn effective_aux_api_port(&self) -> Option<u16> {
+        let api_port = self.api.as_ref().map(|api| api.listen_port)?;
+        self.aux_api
+            .as_ref()
+            .and_then(|aux_api| aux_api.listen_port)
+            // Aux API is required when api.listen_port is configured, but
+            // adding the default `+ 1` port must still remain overflow-safe.
+            .or_else(|| api_port.checked_add(1))
+    }
+
+    pub fn egress_proxy_enabled(&self) -> bool {
+        self.egress
+            .as_ref()
+            .and_then(|egress| egress.allow.as_ref())
+            .is_some_and(|allow| !allow.is_empty())
+    }
+}
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -88,16 +109,90 @@ pub struct AuxApi {
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct VsockPorts {
-    pub status_port: Option<u32>,
-    pub app_log_port: Option<u32>,
-    pub http_egress_port: Option<u32>,
-}
-
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Storage {
     pub s3: Option<S3StorageConfig>,
+    pub mounts: Option<Vec<HostFsMountConfig>>,
+}
+
+impl Storage {
+    fn validate(&self) -> Result<()> {
+        let Some(mounts) = self.mounts.as_ref() else {
+            return Ok(());
+        };
+
+        let mut used_names = HashSet::new();
+        let mut used_paths = HashSet::new();
+        for (index, mount) in mounts.iter().enumerate() {
+            let context = format!("storage.mounts[{index}]");
+            mount.validate(&context)?;
+
+            let mount_name = mount.name.trim().to_ascii_lowercase();
+            if !used_names.insert(mount_name) {
+                bail!("duplicate storage.mounts name: {}", mount.name.trim());
+            }
+
+            if !used_paths.insert(mount.mount_path.clone()) {
+                bail!(
+                    "duplicate storage.mounts mount_path: {}",
+                    mount.mount_path.display()
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostFsMountConfig {
+    pub name: String,
+    pub mount_path: PathBuf,
+    #[serde(default)]
+    pub required: bool,
+    pub size_mb: u64,
+}
+
+impl HostFsMountConfig {
+    fn validate(&self, context: &str) -> Result<()> {
+        const HOSTFS_ALLOWED_ROOT: &str = "/mnt";
+
+        if self.name.trim().is_empty() {
+            bail!("{context}.name is required");
+        }
+        if !self
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            bail!("{context}.name may contain only ASCII letters, digits, '.', '-', and '_'");
+        }
+        if !self.mount_path.is_absolute() {
+            bail!("{context}.mount_path must be absolute");
+        }
+        if self.mount_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        }) {
+            bail!("{context}.mount_path must not contain '.' or '..' path components");
+        }
+        let allowed_root = Path::new(HOSTFS_ALLOWED_ROOT);
+        if self.mount_path == allowed_root || !self.mount_path.starts_with(allowed_root) {
+            bail!(
+                "{context}.mount_path must live under {} (for example {}/appdata)",
+                HOSTFS_ALLOWED_ROOT,
+                HOSTFS_ALLOWED_ROOT
+            );
+        }
+
+        if self.size_mb == 0 {
+            bail!("{context}.size_mb must be greater than 0");
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -423,6 +518,10 @@ impl HeliosRpc {
 fn parse_manifest(buf: &[u8]) -> Result<Manifest> {
     let manifest: Manifest = serde_yaml::from_slice(buf)?;
 
+    if let Some(storage) = manifest.storage.as_ref() {
+        storage.validate()?;
+    }
+
     if let Some(kms_integration) = manifest.kms_integration.as_ref() {
         kms_integration.validate()?;
     }
@@ -441,6 +540,24 @@ fn parse_manifest(buf: &[u8]) -> Result<Manifest> {
 }
 
 fn validate_manifest_cross_constraints(manifest: &Manifest) -> Result<()> {
+    if manifest.aux_api.is_some() && manifest.api.is_none() {
+        bail!("aux_api requires api.listen_port because Aux API proxies the Internal API");
+    }
+
+    if let Some(api) = manifest.api.as_ref() {
+        let aux_port = manifest.effective_aux_api_port().ok_or_else(|| {
+            anyhow!(
+                "api.listen_port={} requires aux_api.listen_port because Aux API is required and api.listen_port + 1 overflows",
+                api.listen_port
+            )
+        })?;
+        if aux_port == api.listen_port {
+            bail!(
+                "aux_api.listen_port must differ from api.listen_port because Aux API and the Internal API cannot share a port"
+            );
+        }
+    }
+
     let kms_cfg = manifest.kms_integration.as_ref().filter(|kms| kms.enabled);
     let Some(kms_cfg) = kms_cfg else {
         return Ok(());
@@ -506,13 +623,33 @@ pub async fn load_manifest<P: AsRef<Path>>(path: P) -> Result<Manifest> {
     Ok(manifest)
 }
 
+pub fn load_manifest_sync<P: AsRef<Path>>(path: P) -> Result<Manifest> {
+    if path.as_ref() == Path::new("-") {
+        bail!("stdin manifests are not supported in synchronous mode");
+    }
+
+    let buf = std::fs::read(&path)
+        .map_err(|err| anyhow!("failed to open {}: {err}", path.as_ref().display()))?;
+
+    parse_manifest(&buf)
+        .map_err(|e| anyhow!("invalid configuration in {}: {e}", path.as_ref().display()))
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::manifest::parse_manifest;
+    use std::path::PathBuf;
+
+    use crate::manifest::{load_manifest_sync, parse_manifest};
 
     #[test]
     fn test_parse_manifest_with_unknown_fields() {
         assert!(parse_manifest(br#"foo: "bar""#).is_err());
+    }
+
+    #[test]
+    fn test_load_manifest_sync_rejects_stdin() {
+        let err = load_manifest_sync("-").unwrap_err().to_string();
+        assert!(err.contains("stdin manifests are not supported in synchronous mode"));
     }
 
     #[test]
@@ -531,6 +668,105 @@ sources:
         assert_eq!(manifest.name, "test");
         assert_eq!(manifest.target, "target-image:latest");
         assert_eq!(manifest.sources.app, "app-image:latest");
+    }
+
+    #[test]
+    fn test_parse_manifest_with_hostfs_mount() {
+        let raw_manifest = br#"
+version: v1
+name: "test-hostfs"
+target: "target-image:latest"
+sources:
+  app: "app-image:latest"
+storage:
+  mounts:
+    - name: appdata
+      mount_path: /mnt/appdata
+      required: true
+      size_mb: 128
+"#;
+
+        let manifest = parse_manifest(raw_manifest).unwrap();
+        let mounts = manifest
+            .hostfs_mounts()
+            .expect("hostfs mounts should be present");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].name, "appdata");
+        assert_eq!(mounts[0].mount_path, PathBuf::from("/mnt/appdata"));
+        assert_eq!(mounts[0].size_mb, 128);
+    }
+
+    #[test]
+    fn test_parse_manifest_rejects_hostfs_mount_outside_allowed_root() {
+        for mount_path in [
+            "/mnt",
+            "/etc/appdata",
+            "/root/.ssh",
+            "/var/lib/appdata",
+            "/tmp/appdata",
+            "/home/appdata",
+            "/run/appdata",
+        ] {
+            let raw_manifest = format!(
+                r#"
+version: v1
+name: "test-hostfs"
+target: "target-image:latest"
+sources:
+  app: "app-image:latest"
+storage:
+  mounts:
+    - name: appdata
+      mount_path: {mount_path}
+      size_mb: 128
+"#
+            );
+
+            assert!(
+                parse_manifest(raw_manifest.as_bytes()).is_err(),
+                "mount path {mount_path} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_manifest_rejects_duplicate_hostfs_mount_names() {
+        let raw_manifest = br#"
+version: v1
+name: "test-hostfs"
+target: "target-image:latest"
+sources:
+  app: "app-image:latest"
+storage:
+  mounts:
+    - name: appdata
+      mount_path: /mnt/appdata
+      size_mb: 128
+    - name: appdata
+      mount_path: /mnt/cache
+      size_mb: 64
+"#;
+
+        assert!(parse_manifest(raw_manifest).is_err());
+    }
+
+    #[test]
+    fn test_parse_manifest_rejects_legacy_hostfs_fields() {
+        let raw_manifest = br#"
+version: v1
+name: "test-hostfs"
+target: "target-image:latest"
+sources:
+  app: "app-image:latest"
+storage:
+  mounts:
+    - name: appdata
+      type: hostfs
+      mount_path: /mnt/appdata
+      size_mb: 64
+"#;
+
+        assert!(parse_manifest(raw_manifest).is_err());
     }
 
     #[test]
@@ -849,6 +1085,56 @@ api:
 
         let manifest = parse_manifest(raw_manifest).unwrap();
         assert!(manifest.helios_rpc.is_none());
+    }
+
+    #[test]
+    fn test_parse_manifest_rejects_aux_api_without_api() {
+        let raw_manifest = br#"
+version: v1
+name: "test-aux-without-api"
+target: "target-image:latest"
+sources:
+  app: "app-image:latest"
+aux_api:
+  listen_port: 9001
+"#;
+
+        let err = parse_manifest(raw_manifest).unwrap_err().to_string();
+        assert!(err.contains("aux_api requires api.listen_port"));
+    }
+
+    #[test]
+    fn test_parse_manifest_rejects_api_without_effective_aux_port() {
+        let raw_manifest = br#"
+version: v1
+name: "test-api-overflow"
+target: "target-image:latest"
+sources:
+  app: "app-image:latest"
+api:
+  listen_port: 65535
+"#;
+
+        let err = parse_manifest(raw_manifest).unwrap_err().to_string();
+        assert!(err.contains("Aux API is required"));
+    }
+
+    #[test]
+    fn test_parse_manifest_rejects_aux_api_port_equal_to_api_port() {
+        let raw_manifest = br#"
+version: v1
+name: "test-api-aux-same-port"
+target: "target-image:latest"
+sources:
+  app: "app-image:latest"
+api:
+  listen_port: 9000
+aux_api:
+  listen_port: 9000
+"#;
+
+        let err = parse_manifest(raw_manifest).unwrap_err().to_string();
+        assert!(err.contains("cannot share a port"));
     }
 
     #[test]

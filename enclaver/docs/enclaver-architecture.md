@@ -14,7 +14,7 @@ The codebase has three execution domains:
 2. host/container runtime
    - run the Sleeve image
    - launch the enclave with `nitro-cli`
-   - provide host-side ingress, egress, log, status, and clock-sync plumbing
+   - provide host-side ingress, egress, hostfs, log, status, and clock-sync plumbing
 
 3. enclave runtime
    - run `odyn` as PID 1
@@ -36,11 +36,13 @@ The codebase has three execution domains:
 
 - `enclaver/src/nitro_cli_container.rs`
   - runs `nitro-cli build-enclave` inside a container
+  - consumes the tiny temporary Docker context that points at the locally tagged amended image
 
 - `enclaver/src/manifest.rs`
   - manifest schema
   - validation rules
   - effective defaults such as default-on `clock_sync`
+  - `storage.mounts[]` validation for host-backed directory mounts
 
 ### Host/runtime path
 
@@ -49,15 +51,33 @@ The codebase has three execution domains:
   - mounts `/dev/nitro_enclaves`
   - sets `privileged: true`
   - wires `-p/--publish` host port mappings
+  - prepares loopback-backed host mount images and bind-mounts them into Sleeve
+
+- `enclaver/src/hostfs.rs`
+  - resolves `--mount` runtime bindings against `storage.mounts[]`
+  - creates or reuses fixed-size loopback images
+  - mounts them on the parent instance and exposes bind mounts to Sleeve
+  - stores per-mount runtime metadata under `<host_state_dir>/.enclaver-hostfs/`
+  - key paths are `disk.img`, `lock`, and transient `mnt-<uuid>/data`
 
 - `enclaver/src/run.rs`
   - runtime orchestrator inside the Sleeve container
-  - starts host-side egress proxy
+  - starts host-side egress proxy when `egress.allow` enables proxying
+  - starts host-side hostfs proxies
   - starts host-side clock-sync server
   - launches the enclave with `nitro-cli`
   - attaches debug console if requested
   - streams status/logs
   - starts host-side ingress proxies
+
+- `enclaver/src/fs_protocol.rs`
+  - request/response protocol for host-backed filesystem operations over vsock
+
+- `enclaver/src/hostfs_service.rs`
+  - host-side filesystem service with path validation and read-only enforcement
+
+- `enclaver/src/proxy/fs_host.rs`
+  - host-side vsock server that exposes one hostfs service per mount
 
 - `enclaver/src/nitro_cli.rs`
   - host-side `nitro-cli` wrapper for `run-enclave`, `terminate-enclave`, `describe-eif`, and console access
@@ -69,7 +89,7 @@ The codebase has three execution domains:
 
 - `enclaver/src/bin/odyn/config.rs`
   - runtime configuration helpers
-  - important detail: if `api` is enabled, Aux API also starts by default on `api.listen_port + 1`
+  - important detail: if `api` is enabled, Aux API is required for attestation and defaults to `api.listen_port + 1`
 
 - `enclaver/src/bin/odyn/enclave.rs`
   - loopback setup and RNG seeding from NSM
@@ -77,6 +97,10 @@ The codebase has three execution domains:
 - `enclaver/src/bin/odyn/egress.rs`
   - enclave-side HTTP proxy
   - sets uppercase and lowercase proxy env vars
+
+- `enclaver/src/bin/odyn/fs_mount.rs`
+  - enclave-side FUSE mount service for host-backed directory mounts
+  - probes hostfs proxies, ensures `/dev/fuse` exists, and mounts each configured path
 
 - `enclaver/src/bin/odyn/clock_sync.rs`
   - default-on clock sync client
@@ -130,6 +154,9 @@ The codebase has three execution domains:
 - `enclaver/src/proxy/egress_http.rs`
   - host and enclave egress proxy implementations
 
+- `enclaver/src/hostfs_client.rs`
+  - enclave-side hostfs client used by the FUSE filesystem implementation
+
 - `enclaver/src/policy/*`
   - egress allow/deny rules for domain/IP matching
 
@@ -150,10 +177,11 @@ The codebase has three execution domains:
 ### Host side (`enclaver-run`)
 
 1. load `/enclave/enclaver.yaml`
-2. start host-side egress proxy when `egress` is present
-3. start host-side clock-sync server unless `clock_sync.enabled=false`
-4. call `nitro-cli run-enclave`
-5. after enclave startup:
+2. start host-side egress proxy when `egress.allow` is non-empty
+3. start host-side hostfs proxies for bound `storage.mounts[]`
+4. start host-side clock-sync server unless `clock_sync.enabled=false`
+5. call `nitro-cli run-enclave`
+6. after enclave startup:
    - attach debug console if requested
    - start log stream
    - start ingress proxies
@@ -164,13 +192,14 @@ The codebase has three execution domains:
 1. open status and log listeners first
 2. load manifest from `/etc/enclaver/enclaver.yaml`
 3. bootstrap loopback and RNG unless `--no-bootstrap`
-4. start egress service
-5. start clock sync
-6. start Helios background tasks
-7. if registry-backed KMS is enabled, wait for Helios readiness on `18545`
-8. start Internal API and Aux API
-9. start ingress
-10. launch user process
+4. start host-backed mount service for `storage.mounts[]`
+5. start egress service
+6. start clock sync
+7. start Helios background tasks
+8. if registry-backed KMS is enabled, wait for Helios readiness on `18545`
+9. start Internal API and Aux API
+10. start ingress
+11. launch user process
 
 Shutdown is the reverse order of service startup.
 
@@ -178,9 +207,15 @@ Shutdown is the reverse order of service startup.
 
 Default images from `enclaver/src/build.rs`:
 
-- Nitro CLI: `public.ecr.aws/s2t1d4c6/enclaver-io/nitro-cli:latest`
+- Nitro CLI: `public.ecr.aws/d4t4u8d2/sparsity-ai/nitro-cli:latest`
 - Odyn: `public.ecr.aws/d4t4u8d2/sparsity-ai/odyn:latest`
 - Sleeve: `public.ecr.aws/d4t4u8d2/sparsity-ai/sleeve:latest`
+
+Current published platforms:
+
+- Nitro CLI: `linux/amd64`
+- Odyn: `linux/amd64`
+- Sleeve: `linux/amd64`
 
 Release image layout:
 
@@ -191,6 +226,10 @@ Sleeve base
 |- /enclave/enclaver.yaml
 `- /enclave/application.eif
 ```
+
+`enclaver-run` reads the packaged `/enclave/enclaver.yaml` copy. Inside the EIF,
+`odyn` reads the matching `/etc/enclaver/enclaver.yaml` copy that was embedded
+before `nitro-cli build-enclave`.
 
 Amended app image before EIF conversion:
 
@@ -204,9 +243,13 @@ original app image
 
 - status VSOCK port: `17000`
 - app log VSOCK port: `17001`
-- egress VSOCK port: `17002`
-- clock-sync VSOCK port: `17003`
+- host-side egress VSOCK port: `20000 + (CID * 128) + 0`
+- host-side clock-sync VSOCK port: `20000 + (CID * 128) + 1`
+- host-side hostfs VSOCK port for mount index `N`: `20000 + (CID * 128) + 16 + N`
 - default enclave egress proxy port: `10000`
+
+`enclaver-run` manages the enclave CID automatically when it launches the EIF,
+so separate Enclaver instances on one EC2 get different host-side VSOCK blocks.
 
 ## Related documents
 

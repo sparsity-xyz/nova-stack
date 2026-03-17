@@ -4,14 +4,15 @@ This is the high-level architecture view. For code-level module mapping, see `do
 
 ## Build-time flow
 
-`enclaver build` does four things:
+`enclaver build` currently does five things:
 
 1. loads `enclaver.yaml`
 2. amends the source app image by adding:
    - `/sbin/odyn`
    - `/etc/enclaver/enclaver.yaml`
-3. runs `nitro-cli build-enclave` in a Nitro CLI container to produce `application.eif`
-4. appends `application.eif` and `enclaver.yaml` to the Sleeve base image
+3. tags that amended image locally as a temporary `enclaver-intermediate-<uuid>:latest`
+4. writes a tiny temporary Docker context whose `Dockerfile` is `FROM <that-local-tag>`, then runs `nitro-cli build-enclave --docker-dir ...` in a Nitro CLI container to produce `application.eif`
+5. appends `application.eif` and `enclaver.yaml` to the Sleeve base image
 
 Result:
 
@@ -23,28 +24,35 @@ release image
 `- /enclave/enclaver.yaml
 ```
 
+That means the manifest is copied twice during build:
+
+- `/enclave/enclaver.yaml` for `enclaver-run` on the host/container side
+- `/etc/enclaver/enclaver.yaml` inside the EIF for `odyn`
+
 ## Runtime flow
 
 Host/container side:
 
 1. `enclaver run` starts the Sleeve image as a privileged Docker container and mounts `/dev/nitro_enclaves`
-2. `enclaver-run` loads `/enclave/enclaver.yaml`
-3. it starts the host-side egress proxy if `egress` is present
-4. it starts the host-side clock-sync time server when clock sync is effectively enabled
-5. it launches the enclave with `nitro-cli run-enclave`
-6. after the enclave is up, it starts host-side ingress proxies and streams logs/status
+2. `enclaver-run` loads `/enclave/enclaver.yaml` for host-side runtime configuration
+3. it starts the host-side egress proxy only when `egress.allow` effectively enables proxying
+4. it starts host-side hostfs proxies for each bound `storage.mounts[]` entry
+5. it starts the host-side clock-sync time server when clock sync is effectively enabled
+6. it launches the enclave with `nitro-cli run-enclave`
+7. after the enclave is up, it starts host-side ingress proxies and streams logs/status
 
 Enclave side:
 
 1. `/sbin/odyn` starts as PID 1
 2. it brings up loopback and seeds RNG from NSM
-3. it starts the enclave-side egress proxy if enabled
-4. it starts the clock-sync client service; clock sync is default-on unless explicitly disabled
-5. it starts Helios in the background when configured
-6. if registry-backed KMS is enabled, it waits for the Helios auth-chain RPC on port `18545`
-7. it starts the Internal API and Aux API
-8. it starts ingress listeners
-9. it launches the user application
+3. it mounts any configured host-backed directories before the app starts
+4. it starts the enclave-side egress proxy if enabled
+5. it starts the clock-sync client service; clock sync is default-on unless explicitly disabled
+6. it starts Helios in the background when configured
+7. if registry-backed KMS is enabled, it waits for the Helios auth-chain RPC on port `18545`
+8. it starts the Internal API and Aux API
+9. it starts ingress listeners
+10. it launches the user application
 
 ## Inside vs outside the EIF
 
@@ -59,6 +67,7 @@ Enclave side:
 | `/enclave/enclaver.yaml` | no | yes |
 | Host ingress proxy | no | yes |
 | Host egress proxy | no | yes |
+| Host hostfs proxy | no | yes |
 | Host clock-sync time server | no | yes |
 
 ## Odyn service model
@@ -67,6 +76,7 @@ Inside the enclave, Odyn runs two kinds of things:
 
 Standalone runtime services:
 
+- host-backed directory mounts via the hostfs file proxy
 - ingress proxy
 - egress proxy
 - clock sync
@@ -112,8 +122,19 @@ Clock sync:
 
 ```text
 Odyn clock-sync client
--> vsock port 17003
+-> host-side vsock port derived from the enclave CID
 -> host time server in enclaver-run
+```
+
+Host-backed directory mount:
+
+```text
+application file API
+-> FUSE mount inside enclave
+-> host-side vsock port derived from the enclave CID and mount index
+-> hostfs proxy in enclaver-run
+-> transient host mount at <host_state_dir>/.enclaver-hostfs/mnt-<uuid>/data
+   backed by <host_state_dir>/.enclaver-hostfs/disk.img
 ```
 
 ## Important VSOCK ports
@@ -122,8 +143,9 @@ Odyn clock-sync client
 |------|-----------|---------|
 | `17000` | enclave -> host | app status stream |
 | `17001` | enclave -> host | app log stream |
-| `17002` | enclave -> host | egress proxy traffic |
-| `17003` | enclave -> host | clock-sync requests |
+| `20000 + (CID * 128) + 0` | enclave -> host | host-side egress proxy traffic |
+| `20000 + (CID * 128) + 1` | enclave -> host | host-side clock-sync requests |
+| `20000 + (CID * 128) + 16 + N` | enclave -> host | host-backed mount traffic for mount index `N` |
 
 Ingress uses the configured `ingress[].listen_port` values rather than a single fixed VSOCK port.
 

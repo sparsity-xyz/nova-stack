@@ -31,22 +31,24 @@ The service startup order in `main.rs` is:
 1. load manifest via `Configuration::load()`
 2. initialize NSM handle
 3. bootstrap loopback and RNG unless `--no-bootstrap`
-4. start egress service
-5. start clock-sync service
-6. start Helios background services
-7. if registry-backed KMS is enabled, wait for Helios readiness on port `18545`
-8. start Internal API and Aux API together
-9. start ingress listeners
-10. launch the user entrypoint
+4. start host-backed mount service for `storage.mounts[]`
+5. start egress service
+6. start clock-sync service
+7. start Helios background services
+8. if registry-backed KMS is enabled, wait for Helios readiness on port `18545`
+9. start Internal API and Aux API together
+10. start ingress listeners
+11. launch the user entrypoint
 
 Shutdown order is the reverse:
 
-1. Aux API
-2. Primary API
-3. clock sync
+1. ingress
+2. Aux API
+3. Primary API
 4. Helios
-5. ingress
+5. clock sync
 6. egress
+7. hostfs unmount (implicit when the mount service is dropped)
 
 ## Important implementation details
 
@@ -62,12 +64,22 @@ Shutdown order is the reverse:
   - `NO_PROXY`
 - `NO_PROXY` and `no_proxy` are currently `localhost,127.0.0.1`
 
+### Host-backed mounts
+
+- Odyn mounts host-backed directories before egress, API startup, and app launch
+- the same primitive can be used as a temporary working directory or persistent state, depending on whether the host state directory is reused
+- each mount uses a deterministic hostfs vsock port derived from the local enclave CID and manifest order
+- required mounts fail startup if the host proxy is unavailable or the FUSE mount cannot be created
+- optional mounts log a warning and are skipped
+- mount paths are created automatically if missing
+- file data, directory metadata, and capacity come from the hostfs file proxy rather than enclave-local storage
+
 ### Clock sync
 
 - clock sync is default-on when omitted from the manifest
 - it starts before API/app launch, but it runs asynchronously
 - it performs an initial sync attempt, then periodic sync
-- it talks to the host over VSOCK port `17003`
+- it talks to the host over a VSOCK port derived from the local enclave CID
 - both sides use timeouts to avoid hanging forever on a stalled request
 
 ### Helios
@@ -79,8 +91,9 @@ Shutdown order is the reverse:
 ### Internal API and Aux API
 
 - Primary API starts only when `api.listen_port` is configured
-- Aux API currently starts whenever Primary API starts
+- Aux API is part of the Primary API contract because attestation flows depend on it
 - if `aux_api.listen_port` is omitted, Aux API uses `api.listen_port + 1`
+- if `api.listen_port + 1` would overflow `u16`, `aux_api.listen_port` must be set explicitly
 - Aux API does not have an independent enable or disable flag
 - Aux API attestation sanitization removes only `public_key`
 - Aux API preserves `nonce` and `user_data`
@@ -151,11 +164,12 @@ This is operational synchronization, not a trusted time source.
 |------|---------|
 | `17000` | status stream |
 | `17001` | application log stream |
-| `17003` | clock-sync requests |
+| `20000 + (CID * 128) + 1` | host-side clock-sync requests |
+| `20000 + (CID * 128) + 16 + N` | host-backed mount traffic for mount index `N` |
 
 Ingress uses configured listen ports rather than a single fixed VSOCK port.
 
-Host-side egress uses port `17002`, but that listener is owned by `enclaver-run`, not Odyn.
+Host-side egress uses `20000 + (CID * 128) + 0`, and that listener is owned by `enclaver-run`, not Odyn.
 
 ## Common failure modes
 
@@ -163,6 +177,7 @@ Host-side egress uses port `17002`, but that listener is owned by `enclaver-run`
 - loopback/RNG bootstrap failure: fatal startup failure
 - S3 enabled without reachable IMDS: API startup failure
 - registry-backed KMS without Helios `18545`: startup failure
+- required host-backed mount unavailable: startup failure
 - ingress bind failure: startup failure
 - child process spawn failure: fatal status reported to host
 
@@ -171,6 +186,7 @@ Host-side egress uses port `17002`, but that listener is owned by `enclaver-run`
 - `enclaver/src/bin/odyn/main.rs`
 - `enclaver/src/bin/odyn/config.rs`
 - `enclaver/src/bin/odyn/clock_sync.rs`
+- `enclaver/src/bin/odyn/fs_mount.rs`
 - `enclaver/src/bin/odyn/helios_rpc.rs`
 - `enclaver/src/bin/odyn/api.rs`
 - `enclaver/src/bin/odyn/aux_api.rs`

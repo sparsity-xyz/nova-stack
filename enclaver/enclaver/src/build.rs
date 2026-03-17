@@ -15,12 +15,13 @@ use log::{debug, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::fs::{canonicalize, rename};
+use tokio::fs::{File, canonicalize, create_dir_all, rename};
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 const ENCLAVE_OVERLAY_CHOWN: &str = "0:0";
 const RELEASE_OVERLAY_CHOWN: &str = "0:0";
 
-const NITRO_CLI_IMAGE: &str = "public.ecr.aws/s2t1d4c6/enclaver-io/nitro-cli:latest";
+const NITRO_CLI_IMAGE: &str = "public.ecr.aws/d4t4u8d2/sparsity-ai/nitro-cli:latest";
 const ODYN_IMAGE: &str = "public.ecr.aws/d4t4u8d2/sparsity-ai/odyn:latest";
 const ODYN_IMAGE_BINARY_PATH: &str = "/usr/local/bin/odyn";
 const SLEEVE_IMAGE: &str = "public.ecr.aws/d4t4u8d2/sparsity-ai/sleeve:latest";
@@ -252,6 +253,24 @@ impl EnclaveArtifactBuilder {
         Ok(packaged_img)
     }
 
+    async fn write_nitro_cli_docker_context(
+        build_dir: &TempDir,
+        source_image_ref: &str,
+    ) -> Result<PathBuf> {
+        let docker_context_dir = build_dir.path().join("docker-context");
+        create_dir_all(&docker_context_dir).await?;
+
+        let dockerfile_path = docker_context_dir.join("Dockerfile");
+        let mut dockerfile = File::create(&dockerfile_path).await?;
+        dockerfile
+            .write_all(format!("FROM {source_image_ref}\n").as_bytes())
+            .await?;
+        dockerfile.flush().await?;
+        dockerfile.shutdown().await?;
+
+        Ok(docker_context_dir)
+    }
+
     /// Convert the referenced image to an EIF file, which will be deposited into `build_dir`
     /// using the file name `eif_name`.
     ///
@@ -267,17 +286,34 @@ impl EnclaveArtifactBuilder {
     ) -> Result<EIFInfo> {
         let build_dir_path = build_dir.path().to_str().unwrap();
 
-        // There is currently no way to point nitro-cli to a local image ID; it insists
-        // on attempting to pull the image (this may be a bug;. As a workaround, give our image a random
-        // tag, and pass that.
-        let img_tag = Uuid::new_v4().to_string();
-        self.image_manager.tag_image(source_img, &img_tag).await?;
+        // nitro-cli build-enclave can build from a Dockerfile directory. Tag the amended
+        // image locally once, then build a tiny Docker context that simply FROMs that
+        // local tag so Nitro CLI stays on the local-daemon path instead of probing
+        // remote registries for a temporary image name.
+        let source_tag = format!("enclaver-intermediate-{}", Uuid::new_v4());
+        let source_image_ref = format!("{source_tag}:latest");
+        self.image_manager
+            .tag_image(source_img, &source_tag)
+            .await?;
 
-        debug!("tagged intermediate image: {}", img_tag);
+        let docker_context_dir =
+            Self::write_nitro_cli_docker_context(build_dir, &source_image_ref).await?;
+        debug!(
+            "tagged intermediate image: {} and wrote docker context: {}",
+            source_image_ref,
+            docker_context_dir.to_string_lossy()
+        );
 
         let nitro_cli = NitroCLIContainer::new(self.docker.clone(), nitro_cli_img);
+        let docker_uri = format!("enclaver-eif-build-{}:latest", Uuid::new_v4());
         let build_container_id = nitro_cli
-            .build_enclave(eif_name, &img_tag, build_dir_path, sign)
+            .build_enclave(
+                eif_name,
+                &docker_uri,
+                "/build/docker-context",
+                build_dir_path,
+                sign,
+            )
             .await?;
 
         info!(
@@ -307,24 +343,34 @@ impl EnclaveArtifactBuilder {
             );
         }
 
+        let mut json_buf = Vec::with_capacity(4096);
         let status_code = nitro_cli.wait_container(&build_container_id).await?;
+
+        if status_code == 0 {
+            let mut stdout_stream = nitro_cli.stdout(&build_container_id, false);
+
+            while let Some(line) = stdout_stream.next().await {
+                json_buf.extend_from_slice(line.as_ref());
+            }
+        }
+
+        // Always attempt cleanup, even when nitro-cli exits non-zero, so repeated
+        // builds do not accumulate temporary container/image state in the daemon.
+        let remove_container_result = nitro_cli.remove_container(&build_container_id).await;
+        let _ = self
+            .docker
+            .remove_image(&docker_uri, None::<RemoveImageOptions>, None)
+            .await;
+        let _ = self
+            .docker
+            .remove_image(&source_image_ref, None::<RemoveImageOptions>, None)
+            .await;
+
+        remove_container_result?;
+
         if status_code != 0 {
             return Err(anyhow!("non-zero exit code from nitro-cli",));
         }
-
-        let mut json_buf = Vec::with_capacity(4096);
-        let mut stdout_stream = nitro_cli.stdout(&build_container_id, false);
-
-        while let Some(line) = stdout_stream.next().await {
-            json_buf.extend_from_slice(line.as_ref());
-        }
-
-        // If we make it this far, do a little bit of cleanup
-        nitro_cli.remove_container(&build_container_id).await?;
-        let _ = self
-            .docker
-            .remove_image(&img_tag, None::<RemoveImageOptions>, None)
-            .await?;
 
         Ok(serde_json::from_slice(&json_buf)?)
     }
@@ -359,18 +405,27 @@ impl EnclaveArtifactBuilder {
         name_override: Option<&str>,
         default: &str,
     ) -> Result<ImageRef> {
-        match name_override {
-            Some(image_name) => {
-                let mut img = self.image_manager.find_or_pull(image_name).await?;
-                img.name = Some(image_name.to_string());
-                Ok(img)
-            }
+        // Internal runtime images now follow the same local-first behavior as app
+        // images unless the user explicitly asks for --pull. This keeps default
+        // builds reproducible against preloaded images, while preserving an escape
+        // hatch for callers that want to refresh latest-tag defaults.
+        let (image_name, mut img) = match name_override {
+            Some(image_name) => (
+                image_name,
+                self.image_manager.find_or_pull(image_name).await?,
+            ),
             None => {
-                let mut img = self.image_manager.pull_image(default).await?;
-                img.name = Some(default.to_string());
-                Ok(img)
+                let img = if self.pull_tags {
+                    self.image_manager.pull_image(default).await?
+                } else {
+                    self.image_manager.find_or_pull(default).await?
+                };
+                (default, img)
             }
-        }
+        };
+
+        img.name = Some(image_name.to_string());
+        Ok(img)
     }
 
     async fn resolve_sources(&self, manifest: &Manifest) -> Result<ResolvedSources> {
@@ -433,4 +488,547 @@ pub struct ResolvedSources {
 
     #[serde(rename = "Sleeve")]
     sleeve: ImageRef,
+}
+
+#[cfg(test)]
+mod tests {
+    // Intentionally strict: these tests treat selected docs/workflows/scripts
+    // as part of the product contract, so CI fails fast when code and
+    // user-facing operational guidance drift apart.
+    use super::{EnclaveArtifactBuilder, NITRO_CLI_IMAGE};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    fn nitro_cli_image_repo() -> String {
+        NITRO_CLI_IMAGE
+            .strip_suffix(":latest")
+            .expect("nitro-cli default image should use the latest tag")
+            .to_string()
+    }
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("enclaver crate should live under repository root")
+            .to_path_buf()
+    }
+
+    fn collect_doc_files(path: &Path, files: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            for entry in
+                fs::read_dir(path).unwrap_or_else(|err| panic!("reading directory {path:?}: {err}"))
+            {
+                let entry = entry
+                    .unwrap_or_else(|err| panic!("reading directory entry in {path:?}: {err}"));
+                collect_doc_files(&entry.path(), files);
+            }
+            return;
+        }
+
+        let Some(extension) = path.extension().and_then(|ext| ext.to_str()) else {
+            return;
+        };
+
+        if matches!(extension, "md" | "yaml" | "yml") {
+            files.push(path.to_path_buf());
+        }
+    }
+
+    #[test]
+    fn default_nitro_cli_image_uses_self_hosted_public_ecr() {
+        assert_eq!(
+            NITRO_CLI_IMAGE,
+            "public.ecr.aws/d4t4u8d2/sparsity-ai/nitro-cli:latest"
+        );
+        assert_eq!(
+            nitro_cli_image_repo(),
+            "public.ecr.aws/d4t4u8d2/sparsity-ai/nitro-cli"
+        );
+    }
+
+    #[test]
+    fn sleeve_dockerfiles_default_to_same_nitro_cli_image() {
+        for rel_path in [
+            "dockerfiles/sleeve-dev.dockerfile",
+            "dockerfiles/sleeve-release.dockerfile",
+        ] {
+            let path = repo_root().join(rel_path);
+            let contents =
+                fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {path:?}: {err}"));
+
+            assert!(
+                contents.contains(&format!("ARG NITRO_CLI_IMAGE={NITRO_CLI_IMAGE}")),
+                "{rel_path} should default to {NITRO_CLI_IMAGE}"
+            );
+            assert!(
+                contents.contains("FROM ${NITRO_CLI_IMAGE} AS nitro_cli"),
+                "{rel_path} should source nitro-cli from the overridable build arg"
+            );
+        }
+    }
+
+    #[test]
+    fn nitro_cli_dockerfile_rebuilds_fuse_enabled_blobs() {
+        let path = repo_root().join("dockerfiles/nitro-cli.dockerfile");
+        let contents =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {path:?}: {err}"));
+
+        assert!(
+            contents.contains("aws-nitro-enclaves-sdk-bootstrap"),
+            "nitro-cli image should rebuild the official Nitro Enclaves blobs from source"
+        );
+        assert!(
+            contents.contains("CONFIG_FUSE_FS=y"),
+            "nitro-cli image should enable FUSE in the rebuilt enclave kernel config"
+        );
+        assert!(
+            contents.contains("sed -i -E"),
+            "nitro-cli image should rewrite the upstream kernel config before rebuilding blobs"
+        );
+        assert!(
+            contents.contains("s|^CONFIG_FUSE_FS=.*$|CONFIG_FUSE_FS=y|"),
+            "nitro-cli image should force any existing CONFIG_FUSE_FS setting to CONFIG_FUSE_FS=y"
+        );
+        assert!(
+            contents.contains("test -s \"${kernel_image}\""),
+            "nitro-cli image should verify that the rebuilt kernel binary exists before publishing the blobs"
+        );
+    }
+
+    #[test]
+    fn nitro_cli_validation_script_checks_fuse_and_smoke_builds_eif() {
+        let path = repo_root().join("scripts/validate-nitro-cli-image.sh");
+        let contents =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {path:?}: {err}"));
+
+        assert!(
+            contents.contains("CONFIG_FUSE_FS"),
+            "validation script should verify that the nitro-cli kernel enables FUSE"
+        );
+        assert!(
+            contents.contains("build-enclave"),
+            "validation script should run a smoke EIF build"
+        );
+    }
+
+    #[test]
+    fn enclaver_build_smoke_script_exercises_docker_dir_path() {
+        let path = repo_root().join("scripts/enclaver-build-smoke-test.sh");
+        let contents =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {path:?}: {err}"));
+
+        assert!(
+            contents.contains("\"${ENCLAVER_BIN}\" -v build -f"),
+            "smoke test should execute enclaver build through the CLI entrypoint"
+        );
+        assert!(
+            contents.contains("wrote docker context"),
+            "smoke test should assert that enclaver used the docker-dir Nitro CLI path"
+        );
+        assert!(
+            contents.contains("ENCLAVER_SMOKE_MODE")
+                && contents.contains("Preparing local fixture images for smoke mode"),
+            "smoke test should support a fixture mode for rate-limit-resistant CI coverage"
+        );
+        assert!(
+            contents.contains("uuidgen")
+                || contents.contains("openssl rand -hex")
+                || contents.contains("printf '%s-%s'"),
+            "smoke test should use a high-entropy tag suffix strategy with a safe fallback"
+        );
+        assert!(
+            contents.contains("no manifest")
+                && contents.contains("overwrite any pre-existing local copy"),
+            "smoke test should document why fixture mode temporarily reuses the published nitro-cli tag"
+        );
+        assert!(
+            contents.contains("/enclave/application.eif")
+                && contents.contains("/enclave/enclaver.yaml"),
+            "smoke test should verify the release image contains the packaged EIF bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn nitro_cli_docker_dir_context_uses_local_tag_reference() {
+        let build_dir = TempDir::new().expect("temp dir should be created");
+        let docker_context_dir = EnclaveArtifactBuilder::write_nitro_cli_docker_context(
+            &build_dir,
+            "enclaver-intermediate-test:latest",
+        )
+        .await
+        .expect("docker context should be created");
+
+        let dockerfile_path = docker_context_dir.join("Dockerfile");
+        let contents = fs::read_to_string(&dockerfile_path)
+            .unwrap_or_else(|err| panic!("reading {dockerfile_path:?}: {err}"));
+
+        assert_eq!(contents, "FROM enclaver-intermediate-test:latest\n");
+    }
+
+    #[test]
+    fn nitro_cli_workflow_publishes_and_validates_self_hosted_image() {
+        let path = repo_root().join(".github/workflows/nitro-cli.yaml");
+        let contents =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {path:?}: {err}"));
+
+        assert!(
+            contents.contains(&format!("NITRO_CLI_IMAGE: {}", nitro_cli_image_repo())),
+            "nitro-cli workflow should publish the self-hosted nitro-cli repository"
+        );
+        assert!(
+            contents.contains("scripts/validate-nitro-cli-image.sh"),
+            "nitro-cli workflow should validate the nitro-cli image before publishing it"
+        );
+        assert!(
+            contents.contains("platforms: linux/amd64"),
+            "nitro-cli workflow should publish only linux/amd64"
+        );
+        assert!(
+            !contents.contains("linux/amd64,linux/arm64"),
+            "nitro-cli workflow should not publish linux/arm64"
+        );
+        assert!(
+            contents.contains("cache-from: type=gha,scope=nitro-cli-amd64"),
+            "nitro-cli workflow should reuse the validated build cache for the push build"
+        );
+        assert!(
+            contents.contains("cache-to: type=gha,mode=max,scope=nitro-cli-amd64"),
+            "nitro-cli workflow should export the nitro-cli build cache between validation and push"
+        );
+    }
+
+    #[test]
+    fn ci_workflow_runs_enclaver_build_smoke_test() {
+        let path = repo_root().join(".github/workflows/ci.yaml");
+        let contents =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {path:?}: {err}"));
+
+        assert!(
+            contents.contains("Smoke test enclaver build"),
+            "CI workflow should include the end-to-end enclaver build smoke test job step"
+        );
+        assert!(
+            contents.contains("ENCLAVER_SMOKE_MODE: fixture"),
+            "CI workflow should run the smoke test in fixture mode to avoid registry rate limits"
+        );
+        assert!(
+            contents.contains("timeout-minutes: 15"),
+            "CI workflow should time out the smoke job instead of relying on the platform default"
+        );
+        assert!(
+            contents.contains("./scripts/enclaver-build-smoke-test.sh"),
+            "CI workflow should execute the enclaver build smoke test script"
+        );
+    }
+
+    #[test]
+    fn nitro_cli_publish_script_is_amd64_only() {
+        let path = repo_root().join("scripts/build-and-publish-nitro-cli.sh");
+        let contents =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {path:?}: {err}"));
+
+        assert!(
+            contents.contains("VALIDATION_PLATFORM=\"linux/amd64\""),
+            "nitro-cli publish script should validate only linux/amd64"
+        );
+        assert!(
+            contents.contains("PUBLISH_PLATFORM=\"linux/amd64\""),
+            "nitro-cli publish script should publish only linux/amd64"
+        );
+        assert!(
+            contents.contains("currently supported only on x86_64 hosts"),
+            "nitro-cli publish script should reject non-x86_64 hosts"
+        );
+        assert!(
+            !contents.contains("linux/amd64,linux/arm64"),
+            "nitro-cli publish script should not publish linux/arm64"
+        );
+        assert!(
+            contents.contains("--cache-to \"type=local,dest=${BUILD_CACHE_DIR},mode=max\""),
+            "nitro-cli publish script should save the validated build cache before the push build"
+        );
+        assert!(
+            contents.contains("--cache-from \"type=local,src=${BUILD_CACHE_DIR}\""),
+            "nitro-cli publish script should reuse the validated build cache for the push build"
+        );
+    }
+
+    #[test]
+    fn release_workflow_matches_current_amd64_only_release_contract() {
+        let path = repo_root().join(".github/workflows/release.yaml");
+        let contents =
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {path:?}: {err}"));
+
+        assert!(
+            !contents.contains("Build Nitro CLI Image"),
+            "release workflow should not publish nitro-cli automatically"
+        );
+        assert!(
+            !contents.contains("scripts/validate-nitro-cli-image.sh"),
+            "release workflow should not run the manual nitro-cli validation/publish flow"
+        );
+        assert!(
+            contents.contains("target: 'x86_64-unknown-linux-musl'"),
+            "release workflow should still build the x86_64 release binaries"
+        );
+        assert!(
+            !contents.contains("target: 'aarch64-unknown-linux-musl'"),
+            "release workflow should not build aarch64 release binaries"
+        );
+        assert!(
+            contents.contains("mv x86_64-unknown-linux-musl amd64"),
+            "release workflow should rearrange only the x86_64 release artifacts for image publishing"
+        );
+        assert!(
+            !contents.contains("mv aarch64-unknown-linux-musl arm64"),
+            "release workflow should not rearrange arm64 release artifacts"
+        );
+
+        let mut current_file = None;
+        let mut odyn_platforms = None;
+        let mut sleeve_platforms = None;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("file:") {
+                current_file = Some(rest.trim());
+                continue;
+            }
+
+            let Some(rest) = trimmed.strip_prefix("platforms:") else {
+                continue;
+            };
+
+            match current_file {
+                Some("odyn-release.dockerfile") => odyn_platforms = Some(rest.trim()),
+                Some("sleeve-release.dockerfile") => sleeve_platforms = Some(rest.trim()),
+                _ => {}
+            }
+        }
+
+        assert!(
+            odyn_platforms == Some("linux/amd64"),
+            "release workflow should publish odyn only for linux/amd64"
+        );
+        assert!(
+            !odyn_platforms.is_some_and(|platforms| platforms.contains("linux/arm64")),
+            "release workflow should not try to publish odyn for linux/arm64"
+        );
+        assert!(
+            sleeve_platforms == Some("linux/amd64"),
+            "release workflow should publish sleeve only for linux/amd64 because nitro-cli is linux/amd64 only"
+        );
+        assert!(
+            !sleeve_platforms.is_some_and(|platforms| platforms.contains("linux/arm64")),
+            "release workflow should not try to publish sleeve for linux/arm64"
+        );
+    }
+
+    #[test]
+    fn documentation_describes_current_hostfs_and_nitro_cli_model() {
+        // Intentionally strict: these checks pin the user-facing docs to the
+        // current runtime/deployment contract so doc drift fails fast in CI.
+        let root = repo_root();
+        let read = |rel_path: &str| {
+            let path = root.join(rel_path);
+            fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {path:?}: {err}"))
+        };
+
+        let readme = read("README.md");
+        assert!(
+            readme.contains("## Enclaver Highlights"),
+            "README should summarize Enclaver's core capabilities in a dedicated highlights section"
+        );
+        assert!(
+            readme.contains("[Host-Backed Directory Mounts Guide](docs/host_backed_mounts.md)"),
+            "README should point readers to the dedicated host-backed mounts guide instead of inlining the feature details"
+        );
+
+        let hostfs_doc = read("docs/host_backed_mounts.md");
+        assert!(
+            hostfs_doc.to_ascii_lowercase().contains("host-backed")
+                && hostfs_doc
+                    .to_ascii_lowercase()
+                    .contains("temporary directory"),
+            "hostfs design doc should describe the temporary-directory behavior without relying on external product naming"
+        );
+        assert!(
+            hostfs_doc.contains("Whether the mount behaves as \"temporary\" or \"persistent\""),
+            "hostfs design doc should explain that persistence depends on host_state_dir reuse"
+        );
+        assert!(
+            !hostfs_doc.contains("Nova Platform") && !hostfs_doc.contains("/opt/nova/"),
+            "hostfs design doc should avoid Nova Platform-specific naming or example paths"
+        );
+
+        let cli_doc = read("docs/enclaver-cli.md");
+        assert!(
+            cli_doc.contains("hostfs file proxy"),
+            "CLI docs should explain that --mount uses the hostfs file proxy"
+        );
+        assert!(
+            cli_doc.contains("separate `enclaver run` processes can coexist on the same EC2"),
+            "CLI docs should document the current multi-instance runtime support"
+        );
+
+        let port_doc = read("docs/port_handling.md");
+        assert!(
+            port_doc.contains("Multiple `enclaver run` processes can run on the same EC2 instance"),
+            "port handling docs should call out the current multi-instance runtime support"
+        );
+        assert!(
+            port_doc.contains("20000 + (CID * 128) + 0"),
+            "port handling docs should describe the CID-derived host-side egress port formula"
+        );
+        assert!(
+            port_doc.contains("20000 + (CID * 128) + 16 + N"),
+            "port handling docs should describe the CID-derived host-side hostfs port formula"
+        );
+
+        let base_images_doc = read("docs/base-images.md");
+        assert!(
+            base_images_doc.contains("linux/amd64"),
+            "base image docs should state that Nitro CLI publishing is linux/amd64 only"
+        );
+        assert!(
+            base_images_doc.contains("published Odyn image is currently `linux/amd64` only"),
+            "base image docs should state that Odyn publishing is currently linux/amd64 only"
+        );
+        assert!(
+            base_images_doc.contains("published Sleeve image is currently `linux/amd64` only"),
+            "base image docs should state that Sleeve publishing is currently linux/amd64 only"
+        );
+
+        let image_build_doc = read("docs/building_images_guidance.md");
+        assert!(
+            image_build_doc.contains("The helper is currently `x86_64`-only"),
+            "image build docs should explain that the default local sleeve helper currently requires x86_64"
+        );
+        assert!(
+            image_build_doc.contains("--file dockerfiles/odyn-release.dockerfile")
+                && image_build_doc.contains("--platform linux/amd64")
+                && image_build_doc.contains("-t odyn:local ."),
+            "image build docs should show odyn release builds as linux/amd64 only"
+        );
+        assert!(
+            image_build_doc.contains("--file dockerfiles/sleeve-release.dockerfile")
+                && image_build_doc.contains("--platform linux/amd64")
+                && image_build_doc.contains("-t sleeve:local ."),
+            "image build docs should show sleeve release builds as linux/amd64 only"
+        );
+        assert!(
+            image_build_doc.contains("scripts/enclaver-build-smoke-test.sh"),
+            "image build docs should document the enclaver build smoke test helper"
+        );
+        assert!(
+            image_build_doc.contains("ENCLAVER_SMOKE_MODE=fixture"),
+            "image build docs should document the fixture-based smoke test mode"
+        );
+
+        let ci_doc = read("docs/ci.md");
+        assert!(
+            !ci_doc.contains("aarch64-unknown-linux-musl"),
+            "CI docs should not describe aarch64 release binaries anymore"
+        );
+        assert!(
+            ci_doc.contains("packages only the `x86_64` `enclaver` binary into a release tarball"),
+            "CI docs should describe the x86_64-only release artifact packaging"
+        );
+        assert!(
+            ci_doc.contains("ENCLAVER_SMOKE_MODE=fixture")
+                && ci_doc.contains("scripts/enclaver-build-smoke-test.sh"),
+            "CI docs should describe the enclaver build smoke test helper"
+        );
+
+        let nitro_cli_doc = read("docs/nitro_cli_fuse_image.md");
+        assert!(
+            nitro_cli_doc.contains("hostfs file proxy"),
+            "nitro-cli doc should explain why FUSE is needed for the hostfs file proxy"
+        );
+        assert!(
+            nitro_cli_doc.contains("linux/amd64"),
+            "nitro-cli doc should document the current publish architecture"
+        );
+        assert!(
+            !nitro_cli_doc.contains("Nova Platform"),
+            "nitro-cli doc should avoid Nova Platform-specific naming for host-backed mounts"
+        );
+
+        let odyn_doc = read("docs/odyn.md");
+        assert!(
+            !odyn_doc.contains("/opt/nova/"),
+            "odyn docs should avoid Nova Platform-specific example paths for host-backed mounts"
+        );
+
+        let architecture_doc = read("docs/architecture.md");
+        assert!(
+            architecture_doc.contains("host-side vsock port derived from the enclave CID"),
+            "architecture docs should describe that host-side runtime ports are derived from the enclave CID"
+        );
+
+        let detailed_architecture_doc = read("docs/enclaver-architecture.md");
+        assert!(
+            detailed_architecture_doc.contains("20000 + (CID * 128) + 0"),
+            "detailed architecture docs should list the CID-derived egress port formula"
+        );
+
+        let hn_fetcher_doc = read("examples/hn-fetcher/readme.md");
+        assert!(
+            hn_fetcher_doc.contains("#odyn: \"odyn:latest\""),
+            "hn-fetcher example README should match the checked-in example manifest's odyn override comment"
+        );
+        assert!(
+            hn_fetcher_doc.contains("curl http://localhost:9001/v1/encryption/public_key"),
+            "hn-fetcher example README should document the aux API encryption public key endpoint"
+        );
+        assert!(
+            hn_fetcher_doc.contains("removing `public_key` before forwarding")
+                && hn_fetcher_doc.contains("`nonce` and `user_data` are preserved"),
+            "hn-fetcher example README should describe the current aux API attestation sanitization behavior"
+        );
+    }
+
+    #[test]
+    fn documentation_only_keeps_the_upstream_repo_link() {
+        let root = repo_root();
+        let mut files = Vec::new();
+
+        for rel_path in ["README.md", "CODE_OF_CONDUCT.md", "docs", "examples"] {
+            collect_doc_files(&root.join(rel_path), &mut files);
+        }
+
+        let mut violations = Vec::new();
+        for path in files {
+            let rel_path = path
+                .strip_prefix(&root)
+                .expect("doc file should live under the repository root");
+            let contents =
+                fs::read_to_string(&path).unwrap_or_else(|err| panic!("reading {path:?}: {err}"));
+
+            for (line_no, line) in contents.lines().enumerate() {
+                let mentions_upstream = line.contains("enclaver-io")
+                    || line.contains("github.com/enclaver-io")
+                    || line.contains("enclaver.io");
+
+                if !mentions_upstream {
+                    continue;
+                }
+
+                let is_allowed_repo_reference = rel_path == Path::new("README.md")
+                    && line.contains(
+                        "[enclaver-io/enclaver](https://github.com/enclaver-io/enclaver)",
+                    );
+
+                if !is_allowed_repo_reference {
+                    violations.push(format!("{}:{}: {}", rel_path.display(), line_no + 1, line));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "documentation should not reference enclaver-io outside the README upstream repo link: {}",
+            violations.join(" | ")
+        );
+    }
 }

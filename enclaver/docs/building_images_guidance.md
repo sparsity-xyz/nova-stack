@@ -4,7 +4,8 @@ This document covers the image-building paths that exist in the repository today
 
 - local developer images via `scripts/build-docker-images.sh`
 - release-style images via `dockerfiles/*-release.dockerfile`
-- optional Nitro CLI image rebuilds
+- Nitro CLI image rebuilds with a FUSE-enabled enclave kernel
+- the current `enclaver build` handoff from a locally tagged intermediate image to `nitro-cli build-enclave --docker-dir`
 
 ## Prerequisites
 
@@ -31,13 +32,17 @@ From the repository root:
 
 This default mode:
 
-- detects the host architecture
-- builds `odyn` and `enclaver-run` for the matching musl target
+- currently requires an `x86_64` host
+- builds `odyn` and `enclaver-run` for `x86_64-unknown-linux-musl`
 - uses `dockerfiles/odyn-dev.dockerfile`
 - uses `dockerfiles/sleeve-dev.dockerfile`
 - produces:
   - `odyn-dev:latest`
   - `sleeve-dev:latest`
+
+The helper is currently `x86_64`-only because the default Sleeve Dockerfiles
+copy `nitro-cli` from the self-hosted Nitro CLI image, and that image is
+currently published only for `linux/amd64`.
 
 Release-style local tags:
 
@@ -56,13 +61,28 @@ This produces:
 
 1. maps host architecture to:
    - `x86_64` -> `x86_64-unknown-linux-musl`
-   - `aarch64` -> `aarch64-unknown-linux-musl`
+   - `aarch64` -> unsupported in the default helper
 2. runs:
    ```bash
    cross build --target <target> --features run_enclave,odyn [--release]
    ```
 3. copies `odyn` and `enclaver-run` into a temporary Docker build context
 4. builds Odyn and Sleeve images from the selected Dockerfiles
+
+## Current `enclaver build` flow
+
+The current `enclaver build` implementation in `enclaver/src/build.rs` no longer
+hands Nitro CLI an unnamed transient image reference.
+
+Instead it:
+
+1. amends the app image with `/sbin/odyn` and `/etc/enclaver/enclaver.yaml`
+2. tags that amended image locally as `enclaver-intermediate-<uuid>:latest`
+3. writes a tiny temporary Docker context whose `Dockerfile` is just `FROM <that-local-tag>`
+4. runs `nitro-cli build-enclave --docker-dir /build/docker-context --docker-uri enclaver-eif-build-<uuid>:latest`
+
+That keeps the EIF build on the local Docker-daemon path and avoids Nitro CLI
+trying to resolve a temporary image name from a remote registry.
 
 ## Manual developer-image build
 
@@ -88,13 +108,11 @@ For release binaries, switch `debug` to `release` and add `--release` to `cross 
 
 The release Dockerfiles are designed around the layout used by `.github/workflows/release.yaml`.
 
-Expected artifact layout before building images:
+Expected artifact layout before building the currently published release images:
 
 ```text
 ./amd64/odyn
 ./amd64/enclaver-run
-./arm64/odyn
-./arm64/enclaver-run
 ```
 
 Local release-image build example:
@@ -103,13 +121,13 @@ Local release-image build example:
 docker buildx build \
   --file dockerfiles/odyn-release.dockerfile \
   --build-context artifacts=. \
-  --platform linux/amd64,linux/arm64 \
+  --platform linux/amd64 \
   -t odyn:local .
 
 docker buildx build \
   --file dockerfiles/sleeve-release.dockerfile \
   --build-context artifacts=. \
-  --platform linux/amd64,linux/arm64 \
+  --platform linux/amd64 \
   -t sleeve:local .
 ```
 
@@ -118,10 +136,15 @@ How those Dockerfiles work:
 - `odyn-release.dockerfile` copies `${TARGETARCH}/odyn` from the `artifacts` build context
 - `sleeve-release.dockerfile` copies `${TARGETARCH}/enclaver-run` from the `artifacts` build context
 - `sleeve-release.dockerfile` also copies `nitro-cli` and required runtime libraries from the default Nitro CLI image
+- `odyn-release.dockerfile` is currently published only for `linux/amd64`
+- `sleeve-release.dockerfile` is currently published only for `linux/amd64`
 
 ## Nitro CLI image
 
-This repository includes `dockerfiles/nitro-cli.dockerfile` and `scripts/build-and-publish-nitro-cli.sh`.
+This repository includes `dockerfiles/nitro-cli.dockerfile`, `scripts/build-and-publish-nitro-cli.sh`, and `scripts/validate-nitro-cli-image.sh`.
+
+Detailed background on the Nitro CLI kernel/blob rebuild flow lives in
+[`docs/nitro_cli_fuse_image.md`](nitro_cli_fuse_image.md).
 
 Build it locally:
 
@@ -135,7 +158,25 @@ Or use the helper script:
 ./scripts/build-and-publish-nitro-cli.sh --tag latest
 ```
 
-Enclaver does not automatically switch to that rebuilt image. If you want to consume it by default, update the Nitro CLI source used by your build flow.
+The nitro-cli Dockerfile now rewrites the upstream kernel config in place to set `CONFIG_FUSE_FS=y` before rebuilding the official Nitro Enclaves blobs. The helper script then builds a local `linux/amd64` validation image, checks that the rebuilt enclave kernel exposes `CONFIG_FUSE_FS`, performs a smoke `nitro-cli build-enclave`, and only then pushes the `linux/amd64` image. Enclaver uses `public.ecr.aws/d4t4u8d2/sparsity-ai/nitro-cli:latest` by default.
+That self-hosted Nitro CLI image is what gives Enclaver EIFs the FUSE support required for host-backed directory mounts and the hostfs file proxy.
+
+To smoke-test the full `enclaver build` path itself, including the local Docker-context handoff to `nitro-cli build-enclave --docker-dir`, run:
+
+```bash
+cargo build --manifest-path enclaver/Cargo.toml --bin enclaver
+ENCLAVER_BIN=./enclaver/target/debug/enclaver ./scripts/enclaver-build-smoke-test.sh
+```
+
+For a deterministic Linux-only smoke path that avoids public-registry pulls by
+prebuilding local fixture images, run:
+
+```bash
+cargo build --manifest-path enclaver/Cargo.toml --bin enclaver
+ENCLAVER_SMOKE_MODE=fixture \
+  ENCLAVER_BIN=./enclaver/target/debug/enclaver \
+  ./scripts/enclaver-build-smoke-test.sh
+```
 
 ## Troubleshooting
 
@@ -148,6 +189,7 @@ Enclaver does not automatically switch to that rebuilt image. If you want to con
 
 - `scripts/build-docker-images.sh`
 - `scripts/build-and-publish-nitro-cli.sh`
+- `scripts/enclaver-build-smoke-test.sh`
 - `dockerfiles/odyn-dev.dockerfile`
 - `dockerfiles/odyn-release.dockerfile`
 - `dockerfiles/sleeve-dev.dockerfile`

@@ -31,6 +31,9 @@ Packages a Docker image into a self-executing Enclaver container image.
 | `-f`, `--file <PATH>` | Path to the Enclaver manifest file (`enclaver.yaml`). Defaults to `enclaver.yaml` in the current directory. Pass `-` to read from stdin. |
 | `--pull` | Always pull the source Docker images to ensure the latest versions are used. |
 
+Without `--pull`, `enclaver build` is local-first: it reuses locally available
+app, odyn, sleeve, and nitro-cli images when present and pulls only missing refs.
+
 #### Example
 ```bash
 enclaver build -f my-service.yaml
@@ -46,12 +49,13 @@ Runs a pre-packaged Enclaver container image. This command simplifies the `docke
 
 | Option | Description |
 |--------|-------------|
-| `-f`, `--file <PATH>` | Enclaver manifest file. If provided, `enclaver` will look up the `target` image name from this file. |
+| `-f`, `--file <PATH>` | Enclaver manifest file. If provided, `enclaver` will look up the `target` image name from this file. It also supplies `storage.mounts[]` metadata when `--mount` is used. |
 | `image` (positional) | Name of a pre-existing Enclaver image to run. Only used if `-f` is not specified. |
 | `-p`, `--publish <PORT_MAP>` | Port to expose on the host machine (e.g., `8080:80`). Can be used multiple times. |
 | `-d`, `--debug-mode` | Enable debug mode for the enclave supervisor. |
 | `--cpu-count <INT>` | **(New)** Number of vCPUs to assign to the enclave. Overrides the `defaults` section in `enclaver.yaml`. |
 | `--memory-mb <INT>` | **(New)** Enclave memory in MiB. Overrides the `defaults` section in `enclaver.yaml`. |
+| `--mount <NAME=HOST_STATE_DIR>` | Prepare or reuse a loopback-image-backed host directory for a manifest-declared `storage.mounts[]` entry and expose it inside the enclave at that mount's `mount_path` through the hostfs file proxy. `mount_path` must live under `/mnt/...`. Reusing the same `HOST_STATE_DIR` preserves contents across runs. Requires manifest lookup via `-f` or the default `enclaver.yaml`. |
 
 #### Parameter Priority (CPU/RAM)
 
@@ -80,10 +84,17 @@ sudo enclaver run my-service:latest --cpu-count 4 --memory-mb 8192
 sudo enclaver run my-service:latest -p 8080:80 -p 9000:9000
 ```
 
+**Host-backed directory mount:**
+```bash
+sudo enclaver run -f enclaver.yaml --mount appdata=/var/lib/my-service/appdata
+```
+
 ---
 
 ## Notes
 
-- **Privileges**: Running enclaves requires `sudo` or root permissions to access `/dev/nitro_enclaves`.
+- **Privileges**: Running enclaves requires Docker/device access to `/dev/nitro_enclaves`. Many setups use `sudo enclaver run ...`.
 - **Docker Dependency**: `enclaver run` requires a running Docker daemon.
+- **Multiple instances on one EC2**: separate `enclaver run` processes can coexist on the same EC2 because `enclaver-run` derives host-side VSOCK listeners from an automatically managed enclave CID. Docker `-p` host ports still must not overlap.
 - **Port Model**: For full details on `ingress` vs `--publish` and the host/container/enclave mapping layers, see [Port Handling](port_handling.md).
+- **Host-backed mounts**: `--mount` provisions or reuses a dedicated loopback image under the supplied host state directory, binds it into the Sleeve container, and `odyn` mounts it inside the enclave through the hostfs file proxy before the application starts.

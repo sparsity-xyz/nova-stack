@@ -1,9 +1,10 @@
 # CI and Release Workflows
 
-This repository has two GitHub Actions workflows:
+This repository has three GitHub Actions workflows:
 
 - `.github/workflows/ci.yaml`
 - `.github/workflows/release.yaml`
+- `.github/workflows/nitro-cli.yaml`
 
 This document describes the workflows as they exist in the repository today.
 
@@ -86,25 +87,23 @@ cargo test --quiet --manifest-path enclaver/Cargo.toml --features=run_enclave,od
 
 `release.yaml` runs on:
 
-- `push` to `sparsity`
-- `push` tags matching `v*`
+- `release` events of type `published`
 - `workflow_dispatch`
 
 Manual workflow inputs:
 
 - `publish_images`
 - `upload_artifacts`
-- `repo` (defaults to `sparsity-xyz/enclaver`)
+- `repo` (declared in the workflow, defaults to `sparsity-xyz/enclaver`, currently not consumed by any job)
 
 Jobs:
 
 1. `build-release-binaries`
    - targets:
      - `x86_64-unknown-linux-musl`
-     - `aarch64-unknown-linux-musl`
    - builds with `--features=run_enclave,odyn`
    - uses `./.github/actions/cargo-zigbuild` for musl builds
-   - uploads three binaries per target:
+   - uploads three binaries:
      - `enclaver`
      - `enclaver-run`
      - `odyn`
@@ -112,28 +111,31 @@ Jobs:
 
 2. `publish-images`
    - runs when either:
-     - the repo is exactly `sparsity-xyz/enclaver` and the ref is `sparsity` or a tag
+     - the repo is exactly `sparsity-xyz/enclaver` and the event is `release`
      - a manual dispatch sets `publish_images=true`
    - downloads build artifacts
    - renames target directories to Docker architecture names:
      - `x86_64-unknown-linux-musl` -> `amd64`
-     - `aarch64-unknown-linux-musl` -> `arm64`
-   - publishes only these images:
+   - publishes only these runtime images:
      - `public.ecr.aws/d4t4u8d2/sparsity-ai/odyn`
      - `public.ecr.aws/d4t4u8d2/sparsity-ai/sleeve`
    - authenticates to AWS via OIDC and pushes image provenance
 
 3. `upload-release-artifact`
    - runs when either:
-     - the repo is `sparsity-xyz/enclaver` and the ref is a tag
+     - the repo is `sparsity-xyz/enclaver` and the event is `release`
      - a manual dispatch sets `upload_artifacts=true`
-   - packages only the `enclaver` binary into release tarballs
-   - uploads draft GitHub Release assets plus matching SHA256 files
+   - packages only the `x86_64` `enclaver` binary into a release tarball
+   - uploads GitHub Release assets plus matching SHA256 files
 
 Notably:
 
-- the release workflow does not publish a `nitro-cli` image
-- it does not upload `odyn` or `enclaver-run` as standalone GitHub Release tarballs
+- `nitro-cli.yaml` is the manual workflow for publishing just the Nitro CLI image
+- the Nitro CLI publish path is currently `linux/amd64` only
+- `nitro-cli.yaml` validates that the nitro-cli image ships a FUSE-enabled enclave kernel and can complete a smoke `build-enclave` before push
+- `ci.yaml` also runs `ENCLAVER_SMOKE_MODE=fixture ./scripts/enclaver-build-smoke-test.sh` to validate that `enclaver build` completes the `--docker-dir` EIF handoff and release-image packaging path on Linux without depending on public-registry pulls during every CI run
+- selected docs, workflows, and helper scripts are also pinned by unit tests in `enclaver/src/build.rs`, so some doc/workflow drift fails CI as a normal test regression
+- the release workflow still does not upload `odyn` or `enclaver-run` as standalone GitHub Release tarballs
 
 ## Local release reproduction
 
@@ -148,21 +150,30 @@ cargo zigbuild --release \
   --features=run_enclave,odyn
 ```
 
-Build release images locally after arranging `amd64/` and `arm64/` artifact directories:
+Build release images locally after arranging the `amd64/` artifact directory:
 
 ```bash
 docker buildx build \
   --file dockerfiles/odyn-release.dockerfile \
   --build-context artifacts=. \
-  --platform linux/amd64,linux/arm64 \
+  --platform linux/amd64 \
   -t odyn:local .
 
 docker buildx build \
   --file dockerfiles/sleeve-release.dockerfile \
   --build-context artifacts=. \
-  --platform linux/amd64,linux/arm64 \
+  --platform linux/amd64 \
   -t sleeve:local .
 ```
+
+Build and validate the amd64-only Nitro CLI image locally:
+
+```bash
+./scripts/build-and-publish-nitro-cli.sh --tag latest
+```
+
+The official release workflow currently publishes both Odyn and Sleeve only for
+`linux/amd64`.
 
 ## AWS prerequisites for `publish-images`
 
@@ -173,9 +184,11 @@ To run the official publish flow, you need:
 - the IAM role referenced by `release.yaml`
 - public ECR repositories for `sparsity-ai/odyn` and `sparsity-ai/sleeve`
 
+If you also run `.github/workflows/nitro-cli.yaml`, that separate workflow needs the public ECR repository for `sparsity-ai/nitro-cli`.
+
 ## References
 
-- workflow definitions: `.github/workflows/ci.yaml`, `.github/workflows/release.yaml`
+- workflow definitions: `.github/workflows/ci.yaml`, `.github/workflows/release.yaml`, `.github/workflows/nitro-cli.yaml`
 - custom build action: `./.github/actions/cargo-zigbuild`
 - local helper: `scripts/build-docker-images.sh`
 - AWS infra: `aws/cloudformation/infrastructure.yml`

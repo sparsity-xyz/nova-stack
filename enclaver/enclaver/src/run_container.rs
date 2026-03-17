@@ -7,14 +7,18 @@ use bollard::query_parameters::{
     StopContainerOptions, WaitContainerOptions,
 };
 use futures_util::stream::{StreamExt, TryStreamExt};
+use log::{info, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+
+use crate::hostfs::{LoopbackMountRequest, PreparedLoopbackMount, prepare_loopback_mounts};
 
 pub struct Sleeve {
     docker: Arc<Docker>,
     container_id: Option<String>,
     stream_task: Option<tokio::task::JoinHandle<()>>,
+    hostfs_mounts: Vec<PreparedLoopbackMount>,
 }
 
 impl Sleeve {
@@ -28,6 +32,7 @@ impl Sleeve {
             docker: docker_client,
             container_id: None,
             stream_task: None,
+            hostfs_mounts: Vec::new(),
         })
     }
 
@@ -38,9 +43,13 @@ impl Sleeve {
         debug_mode: bool,
         cpu_count: Option<i32>,
         memory_mb: Option<i32>,
+        loopback_mount_requests: Vec<LoopbackMountRequest>,
     ) -> Result<()> {
         if self.container_id.is_some() {
             return Err(anyhow!("container already running"));
+        }
+        if !self.hostfs_mounts.is_empty() {
+            return Err(anyhow!("hostfs mounts already prepared"));
         }
 
         let port_re = regex::Regex::new(r"^(\d+):(\d+)$")?;
@@ -66,6 +75,37 @@ impl Sleeve {
                 }]),
             );
         }
+
+        if !loopback_mount_requests.is_empty() {
+            for request in &loopback_mount_requests {
+                info!(
+                    "Hostfs preflight: mount='{}' host_state_dir={} container_path={} enclave_path={} size_mb={} required={}",
+                    request.name,
+                    request.host_state_dir.display(),
+                    request.container_mount_path.display(),
+                    request.enclave_mount_path.display(),
+                    request.size_mb,
+                    request.required
+                );
+            }
+
+            // Prepare or reuse the loopback-backed host directories before the
+            // Sleeve container starts, then bind-mount them in for hostfs proxying.
+            self.hostfs_mounts = tokio::task::spawn_blocking(move || {
+                prepare_loopback_mounts(&loopback_mount_requests)
+            })
+            .await??;
+        }
+        let bind_mounts = if self.hostfs_mounts.is_empty() {
+            None
+        } else {
+            Some(
+                self.hostfs_mounts
+                    .iter()
+                    .map(PreparedLoopbackMount::container_bind)
+                    .collect::<Vec<_>>(),
+            )
+        };
 
         let container_id = self
             .docker
@@ -97,6 +137,7 @@ impl Sleeve {
                             path_in_container: Some(String::from("/dev/nitro_enclaves")),
                             cgroup_permissions: Some(String::from("rwm")),
                         }]),
+                        binds: bind_mounts,
                         port_bindings: Some(port_bindings),
                         privileged: Some(true),
                         ..Default::default()
@@ -109,6 +150,11 @@ impl Sleeve {
             .id;
 
         self.container_id = Some(container_id.clone());
+
+        info!(
+            "Starting sleeve container image={} debug_mode={} cpu_count={:?} memory_mb={:?}",
+            image_name, debug_mode, cpu_count, memory_mb
+        );
 
         self.docker
             .start_container(&container_id, None::<StartContainerOptions>)
@@ -125,8 +171,6 @@ impl Sleeve {
             .ok_or_else(|| anyhow!("missing wait response from daemon",))?
             .status_code;
 
-        self.container_id = None;
-
         if status_code != 0 {
             return Err(anyhow!("non-zero exit code from container",));
         }
@@ -135,6 +179,7 @@ impl Sleeve {
         self.docker
             .remove_container(&container_id, None::<RemoveContainerOptions>)
             .await?;
+        self.container_id = None;
 
         Ok(())
     }
@@ -156,8 +201,18 @@ impl Sleeve {
         self.stream_task = Some(tokio::task::spawn(async move {
             while let Some(Ok(item)) = log_stream.next().await {
                 match item {
-                    LogOutput::StdOut { message } => stdout.write_all(&message).await.unwrap(),
-                    LogOutput::StdErr { message } => stderr.write_all(&message).await.unwrap(),
+                    LogOutput::StdOut { message } => {
+                        if let Err(err) = stdout.write_all(&message).await {
+                            warn!("stopping sleeve stdout stream after write failure: {err}");
+                            break;
+                        }
+                    }
+                    LogOutput::StdErr { message } => {
+                        if let Err(err) = stderr.write_all(&message).await {
+                            warn!("stopping sleeve stderr stream after write failure: {err}");
+                            break;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -167,18 +222,45 @@ impl Sleeve {
     }
 
     pub async fn cleanup(&mut self) -> Result<()> {
-        if let Some(container_id) = self.container_id.take() {
-            self.docker
-                .stop_container(&container_id, None::<StopContainerOptions>)
-                .await?;
+        let mut first_error = None;
 
-            self.docker
+        if let Some(container_id) = self.container_id.take() {
+            if let Err(err) = self
+                .docker
+                .stop_container(&container_id, None::<StopContainerOptions>)
+                .await
+            {
+                first_error = Some(anyhow!("stopping container: {}", err));
+            }
+
+            if let Err(err) = self
+                .docker
                 .remove_container(&container_id, None::<RemoveContainerOptions>)
-                .await?;
+                .await
+                && first_error.is_none()
+            {
+                first_error = Some(anyhow!("removing container: {}", err));
+            }
         }
 
-        if let Some(stream_task) = self.stream_task.take() {
-            stream_task.await?;
+        if let Some(stream_task) = self.stream_task.take()
+            && let Err(err) = stream_task.await
+            && first_error.is_none()
+        {
+            first_error = Some(anyhow!("waiting for container log stream: {}", err));
+        }
+
+        for mount in self.hostfs_mounts.iter_mut().rev() {
+            if let Err(err) = mount.cleanup()
+                && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        self.hostfs_mounts.clear();
+
+        if let Some(err) = first_error {
+            return Err(err);
         }
 
         Ok(())

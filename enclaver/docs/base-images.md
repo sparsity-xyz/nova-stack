@@ -2,7 +2,7 @@
 
 Enclaver uses three important images in its build and runtime flow. The defaults live in `enclaver/src/build.rs`:
 
-- Nitro CLI: `public.ecr.aws/s2t1d4c6/enclaver-io/nitro-cli:latest`
+- Nitro CLI: `public.ecr.aws/d4t4u8d2/sparsity-ai/nitro-cli:latest`
 - Odyn: `public.ecr.aws/d4t4u8d2/sparsity-ai/odyn:latest`
 - Sleeve: `public.ecr.aws/d4t4u8d2/sparsity-ai/sleeve:latest`
 
@@ -23,7 +23,8 @@ Relevant files:
 - `dockerfiles/nitro-cli.dockerfile`
 - `scripts/build-and-publish-nitro-cli.sh`
 
-The release workflow does not publish a `nitro-cli` image from this repository. Enclaver consumes the default public image unless you override the build sources or rebuild a compatible replacement.
+The repository now publishes a self-hosted `nitro-cli` image through the manual `nitro-cli.yaml` workflow, and Enclaver consumes that image by default. The nitro-cli build rewrites the upstream kernel config to set `CONFIG_FUSE_FS=y`, then replaces the stock enclave blobs with rebuilt bootstrap artifacts.
+That rebuilt kernel support is what allows Odyn to mount host-backed directories through `/dev/fuse` inside the enclave. The publish flow for this image is manual and currently targets `linux/amd64` only.
 
 ### Odyn image
 
@@ -42,6 +43,9 @@ Local tags used by repository tooling:
 
 - debug helper build: `odyn-dev:latest`
 - release-style local build: `odyn:latest`
+
+The published Odyn image is currently `linux/amd64` only to match the current
+release-image publish policy.
 
 ### Sleeve image
 
@@ -63,6 +67,11 @@ Local tags used by repository tooling:
 - debug helper build: `sleeve-dev:latest`
 - release-style local build: `sleeve:latest`
 
+The published Sleeve image is currently `linux/amd64` only. Sleeve embeds
+`nitro-cli` and its runtime libraries from the self-hosted Nitro CLI image, so
+its published platforms currently follow the Nitro CLI image's `linux/amd64`
+limit.
+
 ## How the images are used
 
 Build time:
@@ -72,18 +81,20 @@ Build time:
 3. amend the app image with:
    - `/etc/enclaver/enclaver.yaml`
    - `/sbin/odyn`
-4. run `nitro-cli build-enclave` inside the Nitro CLI image to produce `application.eif`
-5. append `application.eif` and `enclaver.yaml` to the Sleeve image
+4. tag the amended image locally and write a tiny temporary Docker context whose `Dockerfile` is `FROM <local-tag>`
+5. run `nitro-cli build-enclave --docker-dir <that-context>` inside the Nitro CLI image to produce `application.eif`
+6. append `application.eif` and `enclaver.yaml` to the Sleeve image
 
 Runtime:
 
 - the final release image is a Sleeve image plus `/enclave/application.eif` and `/enclave/enclaver.yaml`
-- `enclaver-run` starts inside the container and uses `nitro-cli` to launch the enclave
+- `enclaver-run` reads `/enclave/enclaver.yaml` for host-side runtime behavior and uses `nitro-cli` to launch the enclave
+- inside the EIF, `odyn` reads the matching manifest copy at `/etc/enclaver/enclaver.yaml`
 
 ## Local inspection commands
 
 ```bash
-docker pull public.ecr.aws/s2t1d4c6/enclaver-io/nitro-cli:latest
+docker pull public.ecr.aws/d4t4u8d2/sparsity-ai/nitro-cli:latest
 docker pull public.ecr.aws/d4t4u8d2/sparsity-ai/odyn:latest
 docker pull public.ecr.aws/d4t4u8d2/sparsity-ai/sleeve:latest
 
@@ -91,7 +102,7 @@ docker image inspect public.ecr.aws/d4t4u8d2/sparsity-ai/sleeve:latest
 docker history public.ecr.aws/d4t4u8d2/sparsity-ai/sleeve:latest
 
 docker run --rm --entrypoint ls \
-  public.ecr.aws/s2t1d4c6/enclaver-io/nitro-cli:latest \
+  public.ecr.aws/d4t4u8d2/sparsity-ai/nitro-cli:latest \
   -la /usr/bin /lib64
 ```
 
