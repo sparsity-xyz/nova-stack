@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Nova Enclave Capsule - AWS Infrastructure for GitHub Actions CI/CD'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: nova-enclave-capsule
+    Description: Project name prefix for resources
+
+  GitHubOrg:
+    Type: String
+    Default: sparsity-xyz
+    Description: GitHub organization name
+
+  GitHubRepo:
+    Type: String
+    Default: nova-enclave-capsule
+    Description: GitHub repository name
+
+  GitHubActionsRoleName:
+    Type: String
+    Default: Github-Workflow-Publish-AWS-ECR-Nova-Enclave-Capsule
+    Description: IAM role name used by GitHub Actions for this repository
+
+  ECRPublicAlias:
+    Type: String
+    Default: d4t4u8d2
+    Description: ECR Public registry alias
+
+Resources:
+  #############################################
+  # IAM Role for GitHub Actions (ECR Publish)
+  #############################################
+  GitHubActionsECRRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref GitHubActionsRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrg}/${GitHubRepo}:*'
+      Policies:
+        - PolicyName: ECRPublicAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ECR Public authentication
+              - Effect: Allow
+                Action:
+                  - ecr-public:GetAuthorizationToken
+                  - sts:GetServiceBearerToken
+                Resource: '*'
+              # ECR Public repository operations
+              - Effect: Allow
+                Action:
+                  - ecr-public:BatchCheckLayerAvailability
+                  - ecr-public:GetRepositoryPolicy
+                  - ecr-public:DescribeRepositories
+                  - ecr-public:DescribeImages
+                  - ecr-public:InitiateLayerUpload
+                  - ecr-public:UploadLayerPart
+                  - ecr-public:CompleteLayerUpload
+                  - ecr-public:PutImage
+                Resource:
+                  - !Sub 'arn:aws:ecr-public::${AWS::AccountId}:repository/sparsity-ai/*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  GitHubOIDCProviderArn:
+    Description: Existing GitHub OIDC Provider ARN
+    Value: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+
+  GitHubActionsRoleArn:
+    Description: IAM Role ARN for GitHub Actions (use in workflow role-to-assume)
+    Value: !GetAtt GitHubActionsECRRole.Arn
+
+  GitHubActionsRoleName:
+    Description: IAM role name for GitHub Actions
+    Value: !Ref GitHubActionsRoleName
+
+  ECRPublicRegistry:
+    Description: ECR Public registry URL
+    Value: !Sub 'public.ecr.aws/${ECRPublicAlias}'
+
+  CapsuleRuntimeImageURI:
+    Description: Capsule Runtime container image URI
+    Value: !Sub 'public.ecr.aws/${ECRPublicAlias}/sparsity-ai/capsule-runtime'
+
+  CapsuleShellImageURI:
+    Description: Capsule Shell container image URI
+    Value: !Sub 'public.ecr.aws/${ECRPublicAlias}/sparsity-ai/capsule-shell'
+
+  NitroCliImageURI:
+    Description: Nitro CLI container image URI
+    Value: !Sub 'public.ecr.aws/${ECRPublicAlias}/sparsity-ai/nitro-cli'
+
+  SetupInstructions:
+    Description: Setup instructions
+    Value: |
+      1. Deploy this stack in us-east-1 (required for ECR Public)
+      2. Ensure the GitHub OIDC provider already exists in the account:
+        - arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+      3. Create ECR Public repositories manually in console:
+         - sparsity-ai/capsule-runtime
+         - sparsity-ai/capsule-shell
+         - sparsity-ai/nitro-cli
+      4. Only ${GitHubOrg}/${GitHubRepo} can assume GitHubActionsRoleArn via OIDC

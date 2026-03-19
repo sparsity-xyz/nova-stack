@@ -24,6 +24,8 @@ The ZKP CLI streamlines the final step of the Nova Stack pipeline. It provides t
 
 The ZKP CLI is designed to work seamlessly with the other components of the Nova Stack:
 
+Applications are built and deployed with Nova Enclave Capsule before the final attestation and registration step handled by ZKP CLI.
+
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
 │                             NOVA STACK PIPELINE                                          │
@@ -32,11 +34,11 @@ The ZKP CLI is designed to work seamlessly with the other components of the Nova
 │   1. DEVELOP              2. BUILD               3. DEPLOY             4. REGISTER       │
 │   ──────────              ────────               ────────              ────────────      │
 │   ┌────────────┐          ┌────────────┐         ┌────────────┐        ┌────────────┐    │
-│   │  Enclaver  │  ──────▶ │  App Hub   │ ──────▶ │  Enclaver  │ ─────▶ │  ZKP CLI   │    │
+│   │  Capsule   │  ──────▶ │  App Hub   │ ──────▶ │  Capsule   │ ─────▶ │  ZKP CLI   │    │
 │   │            │          │            │         │            │        │            │    │
 │   │ Build &    │          │ Transparent│         │ Run your   │        │ Attest,    │    │
-│   │ test your  │          │ CI/CD build│         │ EIF on AWS │        │ Prove &    │    │
-│   │ TEE app    │          │ with proofs│         │ Nitro      │        │ Register   │    │
+│   │ test your  │          │ CI/CD build│         │ release    │        │ Prove &    │    │
+│   │ TEE app    │          │ with proofs│         │ image      │        │ Register   │    │
 │   └────────────┘          └─────┬──────┘         └────────────┘        └─────┬──────┘    │
 │                                 │ Upload hash                                │ Verify &  │
 │                                 ▼    (WIP)                                   ▼ Register  │

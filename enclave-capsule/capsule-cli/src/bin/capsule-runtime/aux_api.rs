@@ -1,0 +1,40 @@
+use anyhow::Result;
+use log::info;
+use tokio::task::JoinHandle;
+
+use crate::config::Configuration;
+use capsule_cli::aux_api::AuxApiHandler;
+use capsule_cli::http_util::HttpServer;
+
+pub struct AuxApiService {
+    task: Option<JoinHandle<()>>,
+}
+
+impl AuxApiService {
+    pub async fn start(config: &Configuration) -> Result<Self> {
+        let task = if let Some(port) = config.aux_api_port() {
+            let api_port = config.api_port().ok_or_else(|| {
+                anyhow::anyhow!("invariant violated: aux_api_port requires api_port")
+            })?;
+            info!("Starting Aux API on port {port} (proxying to API on port {api_port})");
+
+            let srv = HttpServer::bind(port).await?;
+            let handler = AuxApiHandler::new(api_port);
+
+            Some(tokio::task::spawn(async move {
+                _ = srv.serve(handler).await;
+            }))
+        } else {
+            None
+        };
+
+        Ok(Self { task })
+    }
+
+    pub async fn stop(self) {
+        if let Some(task) = self.task {
+            task.abort();
+            _ = task.await;
+        }
+    }
+}

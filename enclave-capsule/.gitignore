@@ -1,0 +1,6 @@
+.idea
+
+*.lock
+!capsule-cli/Cargo.lock
+
+**_pycache__

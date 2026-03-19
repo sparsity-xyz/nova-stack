@@ -2,6 +2,8 @@
 
 This document contains deployment, development, and infrastructure configuration information for Nova App Hub administrators.
 
+> **Transition note**: Nova Stack now uses Nova Enclave Capsule as the stack-level enclave toolkit. The App Hub workflow in this repository is still Enclaver-based today, so this document keeps the current implementation details, artifact names, and file paths where needed.
+
 ## AWS Infrastructure Setup
 
 ### Prerequisites
@@ -41,7 +43,7 @@ aws cloudformation describe-stacks \
 | `DOCKERHUB_USERNAME` | Docker Hub username (optional, helps if app Dockerfiles pull from Docker Hub) |
 | `DOCKERHUB_TOKEN` | Docker Hub access token ([create here](https://hub.docker.com/settings/security)) |
 
-The build workflow now compiles a custom Enclaver binary that uses a `nitro-cli build-enclave --docker-dir` path for EIF generation, so Docker Hub credentials are no longer required just for the Enclaver stage. They are still useful when the application Dockerfile itself pulls from Docker Hub heavily.
+The current build workflow compiles a custom Enclaver binary that uses a `nitro-cli build-enclave --docker-dir` path for EIF generation, so Docker Hub credentials are no longer required just for the Enclaver stage. They are still useful when the application Dockerfile itself pulls from Docker Hub heavily.
 
 4. Update workflow environment variables in `.github/workflows/build-on-merge.yml`:
 
@@ -60,7 +62,7 @@ nova-app-hub/
 ├── .github/
 │   └── workflows/
 │       ├── pr-validation.yml       # PR validation
-│       └── build-on-merge.yml      # Build pipeline (Enclaver)
+│       └── build-on-merge.yml      # Build pipeline (current Enclaver-based implementation)
 ├── apps/
 │   ├── _example/                   # Example configuration
 │   │   └── nova-build.yaml
@@ -90,6 +92,8 @@ s3://nova-app-hub-artifacts/builds/<app-name>/<version>/
 ├── build-output.txt
 └── enclaver.yaml
 ```
+
+`enclaver.yaml` remains the artifact name used by the current App Hub workflow; a future pipeline migration can rename this once the implementation switches fully to Nova Enclave Capsule conventions.
 
 ## Remote Attestation
 

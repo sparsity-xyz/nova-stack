@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Nova Enclave Capsule developer documentation">
+    <title>Capsule Developer Documentation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&amp;family=Inter:wght@400;500;600&amp;family=Fira+Code:wght@400;500&amp;display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="layout">
+    <aside class="sidebar">
+        <div class="brand">
+            <div class="logo-stack">
+                <div class="logo-box"></div>
+                <div class="logo-box blur"></div>
+            </div>
+            <div>
+                <h1>Capsule Dev Docs</h1>
+            </div>
+        </div>
+        <nav id="nav">
+            <a href="#overview" class="nav-link active">Overview</a>
+            <a href="#why-capsule" class="nav-link">Why Capsule</a>
+            <a href="#workflow" class="nav-link">Developer Workflow</a>
+            <a href="#modules" class="nav-link">Core Modules</a>
+            <a href="#capabilities" class="nav-link">Core Capabilities</a>
+            <a href="#example" class="nav-link">Minimal Example</a>
+            <a href="#ecosystem" class="nav-link">Templates & Examples</a>
+            <a href="#start" class="nav-link">Recommended Path</a>
+        </nav>
+    </aside>
+
+    <main class="content">
+        <section id="overview" class="section hero">
+            <div class="badge">Developer Documentation</div>
+            <h1 class="gradient-text">Capsule Developer Documentation</h1>
+            <p class="lead">Turn Nitro Enclaves into a standard product workflow instead of a pile of operational chores.</p>
+            <p>Nova Enclave Capsule is a build and runtime toolkit for AWS Nitro Enclaves. It packages Docker images into enclave-ready artifacts and provides a unified runtime surface for networking, attestation, signing, encryption, storage mounts, log forwarding, and clock synchronization, so application teams can focus on business logic, product APIs, and iteration speed.</p>
+
+            <div class="hero-metrics">
+                <div class="metric-card">
+                    <div class="metric-label">Input</div>
+                    <div class="metric-value">A Standard Docker App</div>
+                    <p>You bring a normal container image and a <code>capsule.yaml</code> file instead of hand-assembling Nitro startup and proxy scripts.</p>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Runtime</div>
+                    <div class="metric-value">A Local HTTP Capability Surface</div>
+                    <p>Your app consumes enclave-native capabilities over Capsule APIs on <code>127.0.0.1</code> rather than integrating the AWS NSM SDK directly.</p>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Outcome</div>
+                    <div class="metric-value">Back to Business Work</div>
+                    <p>Build, run, logs, mounts, time sync, ingress, and egress are folded into stable interfaces so teams can spend more time on product development.</p>
+                </div>
+            </div>
+
+            <div class="quick-links">
+                <a href="#start" class="btn btn-primary">Get Started</a>
+                <a href="https://github.com/sparsity-xyz/nova-enclave-capsule" target="_blank" rel="noreferrer" class="btn btn-secondary">View Repository</a>
+            </div>
+        </section>
+
+        <hr class="divider">
+
+        <section id="why-capsule" class="section">
+            <div class="section-header">
+                <h2>Why Use Capsule</h2>
+                <p>Capsule is valuable not just because it can launch enclaves, but because it turns enclave work from a one-off integration project into a repeatable, maintainable, product-oriented development path.</p>
+            </div>
+
+            <div class="comparison-grid">
+                <div class="comp-card">
+                    <h4>Without Capsule, teams usually end up handling</h4>
+                    <ul>
+                        <li>Raw VSOCK and CID planning plus host-side forwarding</li>
+                        <li>Custom ingress and egress proxies with policy logic</li>
+                        <li>Low-level NSM, attestation, and signing integration</li>
+                        <li>Enclave logging, exit handling, and clock drift issues</li>
+                        <li>Host-backed mounts, loopback images, and file proxy plumbing</li>
+                    </ul>
+                </div>
+                <div class="comp-card highlight">
+                    <h4>With Capsule, the workflow becomes</h4>
+                    <ul>
+                        <li><span class="check">✓</span> Standard Docker images entering an enclave build flow</li>
+                        <li><span class="check">✓</span> A single <code>capsule.yaml</code> file declaring the runtime contract</li>
+                        <li><span class="check">✓</span> Localhost APIs for enclave-native capabilities</li>
+                        <li><span class="check">✓</span> One CLI for build, run, packaging, and debugging</li>
+                        <li><span class="check">✓</span> More time spent on business services instead of runtime plumbing</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="doc-grid">
+                <div class="doc-card">
+                    <div class="module-label">Simple</div>
+                    <h3>It is easier to adopt</h3>
+                    <p>Capsule accepts a normal application plus a config file. You do not need to become a Nitro Enclaves expert before building your first enclave app.</p>
+                </div>
+                <div class="doc-card">
+                    <div class="module-label">More Capabilities</div>
+                    <h3>It ships with more built-in functionality</h3>
+                    <p>Attestation, randomness, signing, encryption, S3, KMS, App Wallet, Helios RPC, and host-backed mounts can all be enabled as needed instead of rebuilt per project.</p>
+                </div>
+                <div class="doc-card">
+                    <div class="module-label">Product Focus</div>
+                    <h3>It frees teams from ops-heavy work</h3>
+                    <p>Capsule pushes shared Nitro runtime concerns into the platform layer so business code can focus on APIs, state, chain interaction, data flows, and user value.</p>
+                </div>
+            </div>
+
+            <div class="callout">
+                <p><strong>In one sentence:</strong> Capsule lets you treat an enclave as an application runtime with special trust and security capabilities, not as a pile of infrastructure pieces you have to wire together yourself.</p>
+            </div>
+        </section>
+
+        <section id="workflow" class="section">
+            <div class="section-header">
+                <h2>Developer Workflow</h2>
+                <p>Capsule reduces the path from application code to enclave runtime into four stable steps. That simplification is one of the main reasons it improves developer velocity.</p>
+            </div>
+
+            <div class="timeline">
+                <div class="timeline-item">
+                    <div class="timeline-step">01</div>
+                    <div>
+                        <h3>Start with a normal Docker application</h3>
+                        <p>Your service can still be a standard web app, API, or worker. If it runs in a container and listens on a known port, it can enter the Capsule flow.</p>
+                    </div>
+                </div>
+                <div class="timeline-item">
+                    <div class="timeline-step">02</div>
+                    <div>
+                        <h3>Write <code>capsule.yaml</code></h3>
+                        <p>Declare ingress ports, egress policy, Capsule API ports, mounts, KMS, S3, Helios, and other runtime requirements in one manifest.</p>
+                    </div>
+                </div>
+                <div class="timeline-item">
+                    <div class="timeline-step">03</div>
+                    <div>
+                        <h3>Run <code>capsule-cli build</code></h3>
+                        <p>The CLI reads the manifest, injects <code>capsule-runtime</code> into the app image, builds the EIF, and packages a runnable release image on top of <code>capsule-shell</code>.</p>
+                    </div>
+                </div>
+                <div class="timeline-item">
+                    <div class="timeline-step">04</div>
+                    <div>
+                        <h3>Run <code>capsule-cli run</code></h3>
+                        <p><code>capsule-shell</code> launches the Nitro Enclave and host-side helpers, while <code>capsule-runtime</code> starts inside the enclave as PID 1 and supervises your application.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="code-box-wrapper">
+                <div class="code-box-header">Build And Run Flow</div>
+<pre><code>Docker App
+  -> capsule.yaml
+  -> capsule-cli build
+  -> release image (contains application.eif + capsule-shell)
+  -> capsule-cli run
+  -> capsule-shell launches enclave on host
+  -> capsule-runtime starts inside enclave
+  -> your app uses Capsule APIs on 127.0.0.1</code></pre>
+                <div class="code-note">The core idea is simple: keep writing a normal service, and let Capsule convert it into something that is runnable, manageable, and accessible inside an enclave.</div>
+            </div>
+        </section>
+
+        <section id="modules" class="section">
+            <div class="section-header">
+                <h2>Core Modules</h2>
+                <p>The best way to understand Capsule is not to memorize commands, but to understand what each module owns and which layer your application should actually interact with.</p>
+            </div>
+
+            <div class="diagram-panel">
+                <img src="../docs/img/diagram-capsule-components.svg" alt="Nova Enclave Capsule runtime architecture">
+                <p class="caption">The architecture diagram in this repository shows the relationships between the host container, Capsule Shell, the enclave, Capsule Runtime, and the main integrations.</p>
+            </div>
+
+            <div class="architecture-grid">
+                <div class="module-card">
+                    <div class="module-label">Developer Tooling</div>
+                    <h3>Capsule CLI</h3>
+                    <p>The developer entry point. It reads the manifest, builds the EIF, produces the release image, and helps you launch the runtime during development and deployment.</p>
+                </div>
+                <div class="module-card">
+                    <div class="module-label">Host Side</div>
+                    <h3>Capsule Shell</h3>
+                    <p>The host-side runtime wrapper around <code>nitro-cli</code>. It also owns host-side proxies, file proxy services, clock sync serving, and log forwarding.</p>
+                </div>
+                <div class="module-card">
+                    <div class="module-label">Enclave Side</div>
+                    <h3>Capsule Runtime</h3>
+                    <p>The PID 1 supervisor inside the enclave. It manages mounts, egress, clock sync, ingress, the Capsule API, optional Helios RPC, and the lifecycle of your application process.</p>
+                </div>
+                <div class="module-card">
+                    <div class="module-label">Local HTTP Surface</div>
+                    <h3>Capsule API</h3>
+                    <p>A loopback-only <code>/v1/*</code> capability surface by default. Your app uses it over HTTP for attestation, randomness, signing, encryption, S3, KMS, and App Wallet features.</p>
+                </div>
+                <div class="module-card">
+                    <div class="module-label">Restricted Surface</div>
+                    <h3>Aux API</h3>
+                    <p>A restricted proxy surface in front of the Capsule API. It is useful for attestation-facing paths or sidecars that should not receive the full capability set.</p>
+                </div>
+                <div class="module-card">
+                    <div class="module-label">Runtime Contract</div>
+                    <h3><code>capsule.yaml</code></h3>
+                    <p>The contract file for the whole system. It is more than configuration: it defines which ports, policies, and platform features your app expects inside and outside the enclave.</p>
+                </div>
+            </div>
+
+            <div class="callout">
+                <p><strong>Recommended application boundary:</strong> business logic should mostly talk to the <code>Capsule API</code>, normal file paths, and standard network ports. Avoid pushing VSOCK, Nitro CLI, or raw NSM details into application code.</p>
+            </div>
+        </section>
+
+        <section id="capabilities" class="section">
+            <div class="section-header">
+                <h2>Core Capabilities</h2>
+                <p>These capabilities cover most of what enclave applications need in practice, and they are what make Capsule more than a tool that merely starts enclaves.</p>
+            </div>
+
+            <div class="feature-grid">
+                <div class="feature-card glass">
+                    <div class="module-label">Build</div>
+                    <h3>Standard image to EIF flow</h3>
+                    <p>Keep your usual Docker workflow and enter the enclave build path through <code>capsule-cli build</code> instead of maintaining a separate packaging pipeline.</p>
+                </div>
+                <div class="feature-card glass">
+                    <div class="module-label">API</div>
+                    <h3>Local secure capability surface</h3>
+                    <p>Consume enclave-native functionality directly through endpoints like <code>/v1/eth/address</code>, <code>/v1/random</code>, <code>/v1/attestation</code>, and <code>/v1/encryption/*</code>.</p>
+                </div>
+                <div class="feature-card glass">
+                    <div class="module-label">Network</div>
+                    <h3>Ingress and egress control</h3>
+                    <p>Inbound traffic is proxied across host and enclave boundaries, while outbound traffic goes through a local HTTP(S) proxy with explicit allow and deny rules.</p>
+                </div>
+                <div class="feature-card glass">
+                    <div class="module-label">Storage</div>
+                    <h3>Host-backed mounts and S3</h3>
+                    <p>Mount host state into the enclave as normal file paths and optionally enable persistent storage through <code>/v1/s3/*</code>.</p>
+                </div>
+                <div class="feature-card glass">
+                    <div class="module-label">Crypto</div>
+                    <h3>Signing, encryption, and KMS</h3>
+                    <p>Use built-in Ethereum signing, P-384 ECDH encryption, Nova KMS, and App Wallet flows without rebuilding those integrations in every application.</p>
+                </div>
+                <div class="feature-card glass">
+                    <div class="module-label">Operations</div>
+                    <h3>Logs, supervision, and clock sync</h3>
+                    <p>Capsule Runtime owns app supervision, log forwarding, and wall-clock management so the runtime behaves more predictably in production.</p>
+                </div>
+            </div>
+
+            <div class="doc-grid">
+                <div class="doc-card">
+                    <div class="module-label">Current Contract</div>
+                    <h3>Outbound access is an explicit constraint</h3>
+                    <p>Enclaves do not have direct internet access. Your HTTP client must honor <code>HTTP_PROXY</code> and <code>HTTPS_PROXY</code>, or be configured explicitly to use the local proxy.</p>
+                </div>
+                <div class="doc-card">
+                    <div class="module-label">Loopback Only</div>
+                    <h3>The primary API is usually local only</h3>
+                    <p>The full Capsule API typically binds only to <code>127.0.0.1</code>. If you need an external attestation path, expose the restricted Aux API instead of the primary API.</p>
+                </div>
+                <div class="doc-card">
+                    <div class="module-label">App Convention</div>
+                    <h3><code>IN_ENCLAVE</code> is not injected automatically</h3>
+                    <p>If your application wants to branch on <code>IN_ENCLAVE</code>, define that convention yourself in your Dockerfile or startup wrapper.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="example" class="section">
+            <div class="section-header">
+                <h2>A Minimal Developer Example</h2>
+                <p>If you want to get a minimal Capsule app running from scratch, you usually only need one manifest, a little business logic, and two CLI commands.</p>
+            </div>
+
+            <div class="two-column">
+                <div class="code-box-wrapper no-top-margin">
+                    <div class="code-box-header">Minimal capsule.yaml</div>
+<pre><code>version: "v1"
+name: "hello-capsule"
+target: "hello-capsule:enclave"
+
+sources:
+  app: "hello-capsule:latest"
+
+defaults:
+  cpu_count: 2
+  memory_mb: 4096
+
+ingress:
+  - listen_port: 8000
+
+egress:
+  allow:
+    - "api.openai.com"
+    - "169.254.169.254"
+
+api:
+  listen_port: 18000
+
+aux_api:
+  listen_port: 18001</code></pre>
+                    <div class="code-note">If your app only needs Capsule APIs from inside the enclave, you usually do not need to expose <code>18000</code> or <code>18001</code> through <code>ingress</code>.</div>
+                </div>
+
+                <div class="code-box-wrapper no-top-margin">
+                    <div class="code-box-header">Application Code Example</div>
+<pre><code>const capsuleBase = "http://127.0.0.1:18000";
+
+export async function loadCapsuleContext() {
+  const [identity, entropy] = await Promise.all([
+    fetch(`${capsuleBase}/v1/eth/address`).then((r) => r.json()),
+    fetch(`${capsuleBase}/v1/random`).then((r) => r.json()),
+  ]);
+
+  return {
+    enclaveAddress: identity.address,
+    randomBytes: entropy.random_bytes,
+  };
+}</code></pre>
+                    <div class="code-note">Application code only talks to local HTTP endpoints. Attestation, randomness, signing, and encryption are integrated in the same style.</div>
+                </div>
+            </div>
+
+            <div class="steps-v2">
+                <div class="step-card">
+                    <span class="step-tag">01</span>
+                    <div>
+                        <h3>Build the application image first</h3>
+                        <p>Keep your existing Docker workflow, for example <code>docker build -t hello-capsule:latest .</code>.</p>
+                    </div>
+                </div>
+                <div class="step-card">
+                    <span class="step-tag">02</span>
+                    <div>
+                        <h3>Build the Capsule release image</h3>
+                        <p>Run <code>capsule-cli build -f capsule.yaml</code> to convert the app image into a package that can run inside Nitro Enclaves.</p>
+                    </div>
+                </div>
+                <div class="step-card">
+                    <span class="step-tag">03</span>
+                    <div>
+                        <h3>Start the enclave</h3>
+                        <p>Run <code>sudo capsule-cli run -f capsule.yaml -p 8000:8000</code>. Capsule will start both the host-side container and the enclave runtime path for you.</p>
+                    </div>
+                </div>
+                <div class="step-card">
+                    <span class="step-tag">04</span>
+                    <div>
+                        <h3>Verify your business endpoint and Capsule API usage</h3>
+                        <p>Call the app entrypoint from outside while your app calls <code>127.0.0.1:18000</code> internally, and confirm that your business logic and enclave-native capabilities are wired together correctly.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="callout">
+                <p><strong>A practical reference point:</strong> the repository’s <code>examples/hn-fetcher</code> example shows the smallest useful path for adapting application code to Capsule’s egress proxy model.</p>
+            </div>
+        </section>
+
+        <section id="ecosystem" class="section highlight-bg">
+            <div class="badge inverse">Templates And Examples</div>
+            <h2>How To Use Templates And Example Repositories</h2>
+            <p>Capsule solves runtime and platform concerns. If you want to move quickly into actual product work, the best approach is to start from a template and then use example repositories as pattern references.</p>
+
+            <div class="steps-v2">
+                <div class="step-card">
+                    <span class="step-tag">Template</span>
+                    <div>
+                        <h3><code>nova-app-template</code>: the fastest way to bootstrap</h3>
+                        <p>This template already includes a realistic application skeleton: a FastAPI backend, a Next.js frontend, example contracts, and a <code>capsule.yaml</code> template that matches the broader Nova workflow. It also includes demo routes for KMS, App Wallet, S3, mounted directories, and encryption, so you can begin from an app-shaped project rather than a toy sample.</p>
+                        <p><a href="https://github.com/sparsity-xyz/nova-app-template" target="_blank" rel="noreferrer">Open nova-app-template</a></p>
+                    </div>
+                </div>
+                <div class="step-card">
+                    <span class="step-tag">Examples</span>
+                    <div>
+                        <h3><code>sparsity-nova-examples</code>: look up patterns by capability</h3>
+                        <p>If you were referring to a general example repository as <code>nova-app-examples</code>, the current public repository is <code>sparsity-nova-examples</code>. It is best used as a pattern library for concrete problems such as minimal attestation flows, browser-to-enclave encrypted transport, persistent backends with Helios, and on-chain randomness or oracle workloads.</p>
+                        <p><a href="https://github.com/sparsity-xyz/sparsity-nova-examples" target="_blank" rel="noreferrer">Open sparsity-nova-examples</a></p>
+                    </div>
+                </div>
+                <div class="step-card">
+                    <span class="step-tag">Docs</span>
+                    <div>
+                        <h3>This repository’s docs: verify the actual runtime contract</h3>
+                        <p>Whenever you need the real Capsule behavior rather than an example-specific shortcut, come back to this repository’s docs and implementation for the authoritative contract around <code>capsule.yaml</code>, Capsule API behavior, port handling, runtime startup order, host-backed mounts, and the VSOCK model.</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="reference-grid">
+                <a class="reference-card" href="../docs/capsule.yaml">
+                    <div class="module-label">Manifest</div>
+                    <h3><code>docs/capsule.yaml</code></h3>
+                    <p>Review the full configuration contract and field-level usage rules.</p>
+                </a>
+                <a class="reference-card" href="../docs/capsule-runtime.md">
+                    <div class="module-label">Runtime</div>
+                    <h3><code>docs/capsule-runtime.md</code></h3>
+                    <p>Understand Capsule Runtime as the PID 1 supervisor inside the enclave.</p>
+                </a>
+                <a class="reference-card" href="../docs/capsule-api.md">
+                    <div class="module-label">API</div>
+                    <h3><code>docs/capsule-api.md</code></h3>
+                    <p>Inspect the actual <code>/v1/*</code> API contract and response formats.</p>
+                </a>
+                <a class="reference-card" href="../docs/port_handling.md">
+                    <div class="module-label">Networking</div>
+                    <h3><code>docs/port_handling.md</code></h3>
+                    <p>Clarify how <code>ingress</code>, <code>-p</code>, and host/container/enclave port mapping fit together.</p>
+                </a>
+            </div>
+        </section>
+
+        <section id="start" class="section">
+            <div class="section-header">
+                <h2>Recommended Adoption Path</h2>
+                <p>If the goal is to ship a real enclave application quickly, this order tends to work much better than trying to assemble every low-level runtime piece yourself from day one.</p>
+            </div>
+
+            <div class="doc-grid">
+                <div class="doc-card">
+                    <div class="module-label">Phase 1</div>
+                    <h3>Run the template end to end</h3>
+                    <p>Start with <code>nova-app-template</code> and understand the application shape, routes, frontend-backend interaction, and <code>capsule.yaml</code> configuration model first.</p>
+                </div>
+                <div class="doc-card">
+                    <div class="module-label">Phase 2</div>
+                    <h3>Trim it down to your business case</h3>
+                    <p>Keep the modules you need, such as attestation, S3, KMS, or App Wallet, and remove the example routes you do not need so the app returns to a clean product boundary.</p>
+                </div>
+                <div class="doc-card">
+                    <div class="module-label">Phase 3</div>
+                    <h3>Use examples for targeted patterns</h3>
+                    <p>When you hit specific problems like browser encryption, chain interaction, persistence, or oracle logic, use <code>sparsity-nova-examples</code> as a focused reference library.</p>
+                </div>
+                <div class="doc-card">
+                    <div class="module-label">Phase 4</div>
+                    <h3>Then harden the runtime contract</h3>
+                    <p>Converge your egress domains, mounts, KMS settings, Helios config, resource defaults, and published ports into a stable manifest and deployment contract.</p>
+                </div>
+            </div>
+
+            <div class="callout">
+                <p><strong>A useful mindset:</strong> treat Capsule as a framework that adds trusted runtime capabilities to your application, not as a narrow tool that only launches enclaves. That framing leads to cleaner system design and a more durable developer workflow.</p>
+            </div>
+        </section>
+    </main>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>

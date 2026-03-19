@@ -1,6 +1,8 @@
 # Nova App Hub
 
-A centralized, transparent, and trustworthy build platform for AWS Nitro Enclave applications using [Enclaver](https://github.com/sparsity-xyz/enclaver).
+A centralized, transparent, and trustworthy build platform for AWS Nitro Enclave applications in the Nova Stack.
+
+> **Transition note**: Nova Stack now uses [Nova Enclave Capsule](https://github.com/sparsity-xyz/nova-enclave-capsule) as its enclave build and runtime toolkit. The App Hub workflow checked into this repository still uses `enclaver.yaml` and `enclaver build` internally, so this document keeps those current filenames and commands where it describes the existing pipeline.
 
 ## Overview
 
@@ -21,7 +23,7 @@ Nova App Hub enables developers to build their applications into AWS Nitro Encla
 The easiest way to build your application is through [Nova Platform](https://sparsity.cloud):
 
 1. Create an app on Nova Platform
-2. Configure your repository URL and enclaver settings
+2. Configure your repository URL and enclave build settings
 3. Click "Trigger Build" - Nova Platform generates both config files automatically
 
 ### Manual Configuration
@@ -36,7 +38,7 @@ Create a new directory under `apps/` with your application name:
 apps/
 └── your-app-name/
     ├── nova-build.yaml    # Build configuration
-    └── enclaver.yaml      # Enclaver configuration
+    └── enclaver.yaml      # Current App Hub enclave manifest format
 ```
 
 #### 2. Configure nova-build.yaml (Build Settings)
@@ -63,7 +65,7 @@ metadata:
   license: MIT
 ```
 
-#### 3. Configure enclaver.yaml (Enclaver Settings)
+#### 3. Configure enclaver.yaml (Current App Hub Enclave Manifest)
 
 ```yaml
 version: v1
@@ -121,7 +123,9 @@ After build completes:
 | `metadata.license` | string | - | License identifier (e.g., MIT) |
 
 
-### Enclaver Configuration (enclaver.yaml)
+### Current App Hub Enclave Configuration (enclaver.yaml)
+
+Nova Stack's runtime toolkit is Nova Enclave Capsule, but the checked-in App Hub workflow has not yet migrated its manifest filename and CLI usage. This section therefore documents the repository's current `enclaver.yaml` format as-is.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -149,7 +153,7 @@ Each build creates a GitHub Release with:
 - Attachments:
   - `pcr.json` - PCR values for attestation
   - `build-metadata.json` - Unified build metadata (source, image, PCR, SLSA)
-  - `enclaver.yaml` - Generated enclaver configuration
+  - `enclaver.yaml` - Generated manifest used by the current App Hub pipeline
 
 ### Running the Release Image
 
@@ -200,14 +204,14 @@ Possible causes:
 
 Most newer instance types: `m5.xlarge`, `c5.xlarge`, `r5.xlarge`, etc. with `.metal` variants having best support.
 
-### Q: How does Enclaver work?
+### Q: How does the current App Hub enclave packaging flow work?
 
-Enclaver packages your application Docker image into a release image containing:
+The checked-in App Hub workflow currently packages your application Docker image into a release image containing:
 1. The EIF (Enclave Image File)
-2. Odyn supervisor for ingress/egress, attestation, encryption
+2. The Enclaver-era runtime components used by the current pipeline
 3. Nitro CLI for enclave lifecycle management
 
-See [Enclaver documentation](https://github.com/sparsity-xyz/enclaver) for details.
+At the Nova Stack level, this role is now filled by Nova Enclave Capsule. See [Nova Enclave Capsule documentation](https://github.com/sparsity-xyz/nova-enclave-capsule) for the current build and runtime model.
 
 ---
 

@@ -1,0 +1,251 @@
+# Nova Enclave Capsule manifest — complete reference (v1)
+#
+# This file lists all supported configuration fields and documents ingress/egress rules.
+# Copy, trim, and edit for your own service. Lines starting with `#` are comments.
+#
+# Contract
+# - Inputs: Docker images, optional signing keys.
+# - Outputs: A release image that contains an EIF plus a packaged manifest for `capsule-shell`;
+#   the EIF also contains a matching `/etc/capsule/capsule.yaml` copy that `capsule-runtime` reads.
+# - Errors: Unknown fields are rejected; missing required fields or malformed values fail at build/run.
+#
+# Notes
+# - If `ingress` is omitted, there is no inbound connectivity into the enclave.
+# - If `egress.allow` is empty or omitted, egress is entirely disabled and no proxy env vars are set.
+# - If you use S3 or other AWS SDK flows that rely on IMDS, ensure egress allows 169.254.169.254.
+# - Domain allow/deny rules support `*` (single label) and `**` (any suffix). See examples below.
+# - IP allow/deny rules support exact IP and CIDR (IPv4/IPv6).
+#
+# ============================================================================
+# Parameter Usage Legend:
+#   [BUILD]   - Used by `capsule-cli build` CLI (build-time only)
+#   [CAPSULE_SHELL]  - Used by `capsule-shell` / Capsule Shell program (host-side runtime)
+#   [CAPSULE_RUNTIME]    - Used by Capsule Runtime supervisor (enclave-side runtime)
+# ============================================================================
+
+# Required top-level fields
+version: "v1"                 # [BUILD] Schema version string. Current docs/examples use "v1".
+name: "your-service"          # [BUILD] Friendly name for your enclave/application (string).
+target: "repo/name:tag"       # [BUILD] Release image tag to produce on build; also the image looked up by `capsule-cli run -f`.
+
+# Source images used during build
+sources:
+  app: "repo/app:tag"         # [BUILD] REQUIRED. The application image to run inside the enclave.
+  # capsule-runtime and capsule-shell may be overridden. If omitted, well-known defaults are pulled.
+  # Default capsule-runtime:   public.ecr.aws/d4t4u8d2/sparsity-ai/capsule-runtime:latest (currently linux/amd64 only)
+  # Default capsule-shell: public.ecr.aws/d4t4u8d2/sparsity-ai/capsule-shell:latest (currently linux/amd64 only)
+  #capsule-runtime: "repo/capsule-runtime:tag"      # [BUILD] Capsule Runtime supervisor image (binary is extracted and added to EIF).
+  #capsule-shell: "repo/capsule-shell:tag"  # [BUILD] Capsule Shell base image (used as base for release image).
+
+# Optional: sign the EIF at build time (keys are read on the host during build).
+# This only affects `capsule-cli build`; it is not used by `capsule-cli run` or by Capsule Runtime at runtime.
+signature:
+  # Paths are resolved relative to the manifest file location.
+  certificate: ./path/to/cert.pem   # [BUILD] Required. Path to X.509 certificate in PEM format
+  key: ./path/to/key.pem            # [BUILD] Required. Path to private key in PEM format
+
+# Optional defaults used by `capsule-cli run` when flags are not provided
+# If omitted, the runtime defaults are cpu_count=2, memory_mb=4096
+defaults:
+  cpu_count: 2               # [CAPSULE_SHELL] Optional. Number of vCPUs (i32) to assign to the enclave
+  memory_mb: 4096            # [CAPSULE_SHELL] Optional. Enclave memory in MiB (i32)
+
+# Ingress: host->enclave TCP listeners exposed by capsule-runtime inside the enclave
+# Each entry binds inside the enclave on the given listen_port and is proxied via a TCP listener
+# in the Capsule Shell container. At run time, `capsule-cli run -p` publishes that container port to the
+# host network as needed.
+#
+# Recommendation: Use the built-in E2E encryption endpoints (/v1/encryption/encrypt,
+# /v1/encryption/decrypt) for tee-pubkey-based client-to-enclave encrypted transport.
+ingress:
+  - listen_port: 18001       # aux API (for attestation)
+  - listen_port: 8080        # [CAPSULE_RUNTIME + CAPSULE_SHELL] Required. TCP port (u16) inside the enclave.
+                             # CAPSULE_RUNTIME: binds EnclaveProxy on this port inside enclave.
+                             # CAPSULE_SHELL: binds HostProxy on the container TCP port to forward to enclave vsock.
+
+  # Example (NOT for production): expose capsule API, and Helios RPC externally.
+  # WARNING: Do not expose these endpoints in production environments.
+  # Production note: do NOT expose capsule API or Helios RPC via ingress.
+  # - listen_port: 18000       # capsule API (full capabilities)
+  # - listen_port: 18545       # Helios RPC chain port
+
+# Egress: enable a local HTTP(S) proxy inside the enclave with allow/deny policy
+# When enabled, capsule-runtime sets http_proxy/https_proxy env vars to http://127.0.0.1:<proxy_port>
+# and `no_proxy=localhost,127.0.0.1` for the entrypoint process.
+egress:
+  proxy_port: 10000          # [CAPSULE_RUNTIME] Optional. TCP port (u16) for local egress proxy (default: 10000).
+                             # CAPSULE_RUNTIME: binds EnclaveHttpProxy on this port, sets http_proxy env var.
+  # Allow and deny take a list of patterns. A request host is allowed iff it matches at least
+  # one allow pattern AND does not match any deny pattern. If `allow` is empty/missing, egress is disabled.
+  allow:
+    # Domain patterns (case-insensitive):
+    # - Multi-label suffix: "**.amazonaws.com" (matches s3.amazonaws.com and a.b.c.amazonaws.com)
+    # NOTE: Domain patterns (including wildcards) DO NOT match IP addresses.
+    # Use CIDR notation for IP filtering.
+    # IP/CIDR patterns:
+    # - Exact IP: "66.254.33.22" (implicit /32)
+    # - IPv4 CIDR: "66.254.33.0/24"
+    # - IPv6 CIDR: "::/0" (all IPv6)
+    - "news.ycombinator.com" # [CAPSULE_RUNTIME] Domain/IP patterns for egress allow list.
+    #- "**"                   # Allow all domains (does not match IP addresses)
+    #- "0.0.0.0/0"           # Allow all IPv4 traffic
+    #- "::/0"                # Allow all IPv6 traffic
+    #- "169.254.169.254"      # IMDS (needed for AWS SDK region/credentials discovery)
+  deny:
+    # Optional block list evaluated after allow. Same grammar as allow.
+    #- "*.example.net"        # [CAPSULE_RUNTIME] Domain/IP patterns for egress deny list.
+    #- "10.0.0.0/8"
+
+# Optional: Nova KMS integration used by Capsule API `/v1/kms/*` and `/v1/app-wallet/*`
+# - Enables `/v1/kms/*` and `/v1/app-wallet/*` routes on the Capsule API.
+# - `/v1/kms/*` calls use registry-backed authz and discovery.
+# - Registry mode is enabled only when both `kms_app_id` and `nova_app_registry` are set.
+# - If registry mode is enabled, `helios_rpc.enabled=true` and `helios_rpc.chains` must
+#   include an entry with `local_rpc_port: 18545`.
+# - Registry RPC uses built-in Helios endpoint (`http://127.0.0.1:18545`).
+# - `use_app_wallet=true` enables app-wallet material stored in KMS KV.
+# - App-wallet local mode (`enabled=true`, `use_app_wallet=true`) can run without registry fields.
+# - Instances that resolve to the same KMS app namespace will share the same app-wallet material.
+# - App-wallet routes are local-use only.
+# - Timeout/retry/discovery settings are CAPSULE_RUNTIME internal defaults (not YAML-configurable).
+# - Any extra fields under `kms_integration` are rejected.
+# - If `storage.s3.encryption.mode=kms`, this integration must also be enabled.
+kms_integration:
+  enabled: true              # [CAPSULE_RUNTIME] Enable Nova KMS integration for Capsule API KMS/app-wallet routes.
+  use_app_wallet: true       # [CAPSULE_RUNTIME] Optional. Enable app-wallet APIs backed by KMS KV (default: false).
+  kms_app_id: 49             # [CAPSULE_RUNTIME] Optional example only. Replace with your real Nova app ID for registry-backed `/v1/kms/*`.
+  nova_app_registry: "0x0f68E6e699f2E972998a1EcC000c7ce103E64cc8" # [CAPSULE_RUNTIME] Optional. Required for registry-backed `/v1/kms/*`.
+
+# Optional: capsule API exposed inside the enclave for attestation/encryption/signing
+api:
+  listen_port: 18000         # [CAPSULE_RUNTIME] Required. TCP port (u16) for capsule API server.
+                             # CAPSULE_RUNTIME: binds CapsuleApiService providing /v1/attestation, /v1/eth/*, etc.
+
+# Optional: auxiliary API port override for restricted external access (e.g., sidecars)
+# If `api` is configured, Aux API is also required because attestation flows proxy through it.
+# If not specified, it defaults to api.listen_port + 1.
+# If `api.listen_port + 1` would overflow `u16`, set `aux_api.listen_port` explicitly.
+# There is no separate Aux API enabled/disabled flag today.
+aux_api:
+  listen_port: 18001         # [CAPSULE_RUNTIME] Optional. TCP port (u16) for auxiliary API server.
+                             # CAPSULE_RUNTIME: binds AuxApiService with sanitized attestation endpoint.
+
+# Optional: Helios Ethereum/OP Stack light client RPC (trustless JSON-RPC)
+helios_rpc:
+  enabled: true              # [CAPSULE_RUNTIME] Enable/disable Helios services.
+  chains:                    # [CAPSULE_RUNTIME] Required when enabled. One entry per local Helios endpoint.
+    - name: "L2-base-sepolia"  # [CAPSULE_RUNTIME] Display/logging name for this chain config.
+      network_id: "84532"       # [CAPSULE_RUNTIME] Optional chain id for UI/reference.
+      kind: "opstack"           # [CAPSULE_RUNTIME] ethereum | opstack
+      network: "base-sepolia"   # [CAPSULE_RUNTIME] Network slug for the selected kind.
+      execution_rpc: "https://sepolia.base.org" # [CAPSULE_RUNTIME] Required execution RPC URL.
+      local_rpc_port: 18545     # [CAPSULE_RUNTIME] Required local JSON-RPC port inside enclave.
+      #consensus_rpc: "https://..." # [CAPSULE_RUNTIME] Optional consensus RPC override.
+      #checkpoint: "0x..."          # [CAPSULE_RUNTIME] Optional checkpoint (ethereum only).
+    - name: "ethereum-mainnet"
+      network_id: "1"
+      kind: "ethereum"
+      network: "mainnet"
+      execution_rpc: "https://eth.llamarpc.com"
+      local_rpc_port: 18546
+
+# Optional: S3 storage configuration for persistent data
+storage:
+  s3:
+    enabled: true            # [CAPSULE_RUNTIME] Whether to enable S3 storage integration.
+    bucket: "my-app-data"    # [CAPSULE_RUNTIME] S3 bucket name for storage.
+    prefix: "apps/my-service/" # [CAPSULE_RUNTIME] Key prefix for isolation. If it doesn't end with '/', it will be added.
+    region: "us-east-1"      # [CAPSULE_RUNTIME] Optional. AWS region override for the bucket.
+                             # If omitted, the region is resolved via IMDS.
+                             # Requires egress allow for IMDS (169.254.169.254) and the S3 endpoint.
+    encryption:              # [CAPSULE_RUNTIME] Optional. Transparent encryption for stored values.
+      mode: "kms"            # [CAPSULE_RUNTIME] plaintext | kms
+      key_scope: "object"    # [CAPSULE_RUNTIME] app | object
+      aad_mode: "key"        # [CAPSULE_RUNTIME] none | key | key+version
+      key_version: "v1"      # [CAPSULE_RUNTIME] Version label included in metadata/derivation path.
+      accept_plaintext: true # [CAPSULE_RUNTIME] Allow reading plaintext objects when present.
+                             # Note: mode=kms requires kms_integration.enabled=true.
+
+  # Host-backed directory mounts using a dedicated loopback image per mount.
+  # Reusing the same host state directory preserves contents across runs; deleting
+  # it resets the mount to an empty filesystem.
+  # Runtime behavior:
+  # - `capsule-cli run --mount <name>=<host_state_dir>` creates or reuses a fixed-size
+  #   loopback image under that host state directory.
+  # - The mounted filesystem is bind-mounted into the Capsule Shell container.
+  # - `capsule-shell` serves it over a hostfs file proxy on vsock.
+  # - `capsule-runtime` mounts it inside the enclave before the application starts.
+  # - Mount order defines the derived hostfs vsock port assignment.
+  mounts:
+    - name: "appdata"        # [BUILD] Stable runtime mount identifier.
+      mount_path: "/mnt/appdata" # [CAPSULE_RUNTIME] Path mounted inside the enclave before app launch. Must live under /mnt/.
+      required: true         # [BUILD] Fail runtime binding resolution when omitted.
+      size_mb: 10240         # [BUILD] Loopback image size in MiB. Runtime always creates the host state dir if missing and mounts rw.
+
+# Optional: automatic clock synchronization between host and enclave
+# Without host-assisted sync, long-running enclaves can drift relative to the parent
+# instance's wall clock. That can break JWT validation, TLS certificate checks,
+# and other time-sensitive application behavior.
+# Nova Enclave Capsule enables clock sync by default, even if this block is omitted.
+# Use this block only to disable clock sync or adjust the sync interval.
+# Omit the block entirely to keep defaults, or write `clock_sync: {}` to keep
+# defaults while documenting the setting explicitly.
+clock_sync:
+  # enabled: false           # [CAPSULE_RUNTIME + CAPSULE_SHELL] Optional. Set to false to disable automatic clock synchronization.
+  interval_secs: 300         # [CAPSULE_RUNTIME] Optional. Sync interval in seconds (default: 300).
+                             # CAPSULE_RUNTIME: connects to host time server via vsock, estimates RTT/offset,
+                             # and sets system clock.
+                             # CAPSULE_SHELL: starts a vsock time server on the host side.
+
+# ============================================================================
+# Summary: Parameter -> Module Mapping
+# ============================================================================
+#
+# | Parameter                             | BUILD | CLI | CAPSULE_SHELL | CAPSULE_RUNTIME | Description                                          |
+# |---------------------------------------|:-----:|:---:|:-------------:|:---------------:|------------------------------------------------------|
+# | version                               |   ✓   |     |               |                 | Manifest schema version                              |
+# | name                                  |   ✓   |     |               |                 | Application name for tagging                         |
+# | target                                |   ✓   |     |               |                 | Output release image tag                             |
+# | sources.app                           |   ✓   |     |               |                 | User application Docker image                        |
+# | sources.capsule-runtime               |   ✓   |     |               |                 | Capsule Runtime supervisor image (binary extraction) |
+# | sources.capsule-shell                 |   ✓   |     |               |                 | Capsule Shell base image for release packaging       |
+# | signature.certificate                 |   ✓   |     |               |                 | EIF signing certificate path                         |
+# | signature.key                         |   ✓   |     |               |                 | EIF signing private key path                         |
+# | defaults.cpu_count                    |       |     |       ✓       |                 | Enclave vCPU allocation                              |
+# | defaults.memory_mb                    |       |     |       ✓       |                 | Enclave memory allocation                            |
+# | ingress[].listen_port                 |       |     |       ✓       |        ✓        | Ingress port (both sides bind proxies)               |
+# | egress.proxy_port                     |       |     |               |        ✓        | Local HTTP proxy port inside enclave                 |
+# | egress.allow                          |       |     |               |        ✓        | Egress allow list (domain/IP patterns)               |
+# | egress.deny                           |       |     |               |        ✓        | Egress deny list (domain/IP patterns)                |
+# | kms_integration.enabled               |       |     |               |        ✓        | Enable Nova KMS integration                          |
+# | kms_integration.use_app_wallet        |       |     |               |        ✓        | Enable app-wallet APIs backed by KMS KV              |
+# | kms_integration.kms_app_id            |       |     |               |        ✓        | Nova app ID for registry-backed `/v1/kms/*`          |
+# | kms_integration.nova_app_registry     |       |     |               |        ✓        | Registry contract for `/v1/kms/*`                    |
+# | api.listen_port                       |       |     |               |        ✓        | Capsule API port (attestation, signing, etc.)        |
+# | aux_api.listen_port                   |       |     |               |        ✓        | Auxiliary API port (restricted access)               |
+# | helios_rpc.enabled                    |       |     |               |        ✓        | Enable/disable Helios RPC service                    |
+# | helios_rpc.chains[].name              |       |     |               |        ✓        | Chain config name used in logs/UI                    |
+# | helios_rpc.chains[].network_id        |       |     |               |        ✓        | Optional chain id for reference                      |
+# | helios_rpc.chains[].kind              |       |     |               |        ✓        | Helios client type (ethereum or opstack)             |
+# | helios_rpc.chains[].network           |       |     |               |        ✓        | Network selection for the selected kind              |
+# | helios_rpc.chains[].execution_rpc     |       |     |               |        ✓        | Execution RPC URL (required)                         |
+# | helios_rpc.chains[].local_rpc_port    |       |     |               |        ✓        | Local JSON-RPC port per chain                        |
+# | helios_rpc.chains[].consensus_rpc     |       |     |               |        ✓        | Optional consensus RPC override                      |
+# | helios_rpc.chains[].checkpoint        |       |     |               |        ✓        | Optional checkpoint override (ethereum)              |
+# | storage.s3.enabled                    |       |     |               |        ✓        | Enable/disable S3 storage integration                |
+# | storage.s3.bucket                     |       |     |               |        ✓        | S3 bucket for persistent storage                     |
+# | storage.s3.prefix                     |       |     |               |        ✓        | Prefix for S3 key isolation                          |
+# | storage.s3.region                     |       |     |               |        ✓        | Regional override for S3 bucket                      |
+# | storage.s3.encryption.mode            |       |     |               |        ✓        | Storage encryption mode (plaintext or kms)           |
+# | storage.s3.encryption.key_scope       |       |     |               |        ✓        | Derivation scope (app/object)                        |
+# | storage.s3.encryption.aad_mode        |       |     |               |        ✓        | AAD binding mode for ciphertext metadata             |
+# | storage.s3.encryption.key_version     |       |     |               |        ✓        | Encryption key version label                         |
+# | storage.s3.encryption.accept_plaintext|       |     |               |        ✓        | Allow plaintext reads when present                   |
+# | storage.mounts[].name                 |   ✓   |  ✓  |               |                 | Stable runtime mount identifier                      |
+# | storage.mounts[].mount_path           |       |     |               |        ✓        | Enclave mount path (must live under /mnt)            |
+# | storage.mounts[].required             |   ✓   |  ✓  |               |                 | Fail runtime startup when the bind is missing        |
+# | storage.mounts[].size_mb              |   ✓   |  ✓  |               |                 | Loopback image size in MiB                           |
+# | clock_sync.enabled                    |       |     |       ✓       |        ✓        | Disable clock sync when set to false                 |
+# | clock_sync.interval_secs              |       |     |               |        ✓        | Override clock sync interval in seconds              |
+#
+# ============================================================================

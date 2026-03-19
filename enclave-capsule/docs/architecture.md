@@ -1,0 +1,158 @@
+# Nova Enclave Capsule Architecture
+
+This is the high-level architecture view. For code-level module mapping, see `docs/capsule-architecture.md`.
+
+## Build-time flow
+
+`capsule-cli build` currently does five things:
+
+1. loads `capsule.yaml`
+2. amends the source app image by adding:
+   - `/sbin/capsule-runtime`
+   - `/etc/capsule/capsule.yaml`
+3. tags that amended image locally as a temporary `capsule-intermediate-<uuid>:latest`
+4. writes a tiny temporary Docker context whose `Dockerfile` is `FROM <that-local-tag>`, then runs `nitro-cli build-enclave --docker-dir ...` in a Nitro CLI container to produce `application.eif`
+5. appends `application.eif` and `capsule.yaml` to the Capsule Shell base image
+
+Result:
+
+```text
+release image
+|- /usr/local/bin/capsule-shell
+|- /bin/nitro-cli
+|- /enclave/application.eif
+`- /enclave/capsule.yaml
+```
+
+That means the manifest is copied twice during build:
+
+- `/enclave/capsule.yaml` for `capsule-shell` on the host/container side
+- `/etc/capsule/capsule.yaml` inside the EIF for `capsule-runtime`
+
+## Runtime flow
+
+Host/container side:
+
+1. `capsule-cli run` starts the Capsule Shell image as a privileged Docker container and mounts `/dev/nitro_enclaves`
+2. `capsule-shell` loads `/enclave/capsule.yaml` for host-side runtime configuration
+3. it starts the host-side egress proxy only when `egress.allow` effectively enables proxying
+4. it starts host-side hostfs proxies for each bound `storage.mounts[]` entry
+5. it starts the host-side clock-sync time server when clock sync is effectively enabled
+6. it launches the enclave with `nitro-cli run-enclave`
+7. after the enclave is up, it starts host-side ingress proxies and streams logs/status
+
+Enclave side:
+
+1. `/sbin/capsule-runtime` starts as PID 1
+2. it brings up loopback and seeds RNG from NSM
+3. it mounts any configured host-backed directories before the app starts
+4. it starts the enclave-side egress proxy if enabled
+5. it starts the clock-sync client service; clock sync is default-on unless explicitly disabled
+6. it starts Helios in the background when configured
+7. if registry-backed KMS is enabled, it waits for the Helios auth-chain RPC on port `18545`
+8. it starts the Capsule API and Aux API
+9. it starts ingress listeners
+10. it launches the user application
+
+## Inside vs outside the EIF
+
+| Component | Inside EIF | Outside EIF |
+|-----------|:----------:|:-----------:|
+| User application | yes | no |
+| Capsule Runtime supervisor | yes | no |
+| Embedded `/etc/capsule/capsule.yaml` | yes | no |
+| `capsule-shell` | no | yes |
+| `nitro-cli` | no | yes |
+| `/enclave/application.eif` | no | yes |
+| `/enclave/capsule.yaml` | no | yes |
+| Host ingress proxy | no | yes |
+| Host egress proxy | no | yes |
+| Host hostfs proxy | no | yes |
+| Host clock-sync time server | no | yes |
+
+## Capsule Runtime service model
+
+Inside the enclave, Capsule Runtime runs two kinds of things:
+
+Standalone runtime services:
+
+- host-backed directory mounts via the hostfs file proxy
+- ingress proxy
+- egress proxy
+- clock sync
+- console/log streaming
+- optional Helios RPC
+
+Capsule API capabilities exposed on `/v1/*`:
+
+- attestation
+- Ethereum signing
+- random bytes
+- P-384 encryption/decryption
+- optional S3 storage
+- optional Nova KMS
+- optional app-wallet routes
+
+`kms_integration`, `storage`, and encryption are not separate peer daemons. They are capabilities behind the Capsule API.
+
+## Traffic paths
+
+Ingress:
+
+```text
+host client
+-> docker published port
+-> Capsule Shell host proxy
+-> vsock
+-> Capsule Runtime enclave proxy
+-> 127.0.0.1:<listen_port> inside enclave
+```
+
+Egress:
+
+```text
+application
+-> local HTTP proxy inside enclave
+-> vsock
+-> host HTTP proxy
+-> remote network
+```
+
+Clock sync:
+
+```text
+Capsule Runtime clock-sync client
+-> host-side vsock port derived from the enclave CID
+-> host time server in capsule-shell
+```
+
+Host-backed directory mount:
+
+```text
+application file API
+-> FUSE mount inside enclave
+-> host-side vsock port derived from the enclave CID and mount index
+-> hostfs proxy in capsule-shell
+-> transient host mount at <host_state_dir>/.capsule-hostfs/mnt-<uuid>/data
+   backed by <host_state_dir>/.capsule-hostfs/disk.img
+```
+
+## Important VSOCK ports
+
+| Port | Direction | Purpose |
+|------|-----------|---------|
+| `17000` | enclave -> host | app status stream |
+| `17001` | enclave -> host | app log stream |
+| `20000 + (CID * 128) + 0` | enclave -> host | host-side egress proxy traffic |
+| `20000 + (CID * 128) + 1` | enclave -> host | host-side clock-sync requests |
+| `20000 + (CID * 128) + 16 + N` | enclave -> host | host-backed mount traffic for mount index `N` |
+
+Ingress uses the configured `ingress[].listen_port` values rather than a single fixed VSOCK port.
+
+## Related documents
+
+- `docs/capsule-runtime.md`
+- `docs/port_handling.md`
+- `docs/capsule-api.md`
+- `docs/helios_rpc.md`
+- `docs/nitro_enclave_clock_drift.md`

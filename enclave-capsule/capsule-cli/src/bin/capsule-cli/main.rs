@@ -1,0 +1,241 @@
+use anyhow::{Result, anyhow};
+use capsule_cli::{
+    build::EnclaveArtifactBuilder,
+    build::ResolvedSources,
+    constants::MANIFEST_FILE_NAME,
+    hostfs::{parse_runtime_mount_binding, resolve_loopback_mounts},
+    images::ImageRef,
+    manifest::load_manifest,
+    nitro_cli::EIFMeasurements,
+    run_container::CapsuleShell,
+};
+use clap::{Parser, Subcommand};
+use log::{debug, error};
+
+#[derive(Debug, Parser)]
+#[clap(author, version = env!("CAPSULE_CLI_VERSION_WITH_GIT"))]
+/// Package and run applications in Nitro Enclaves.
+struct Cli {
+    #[clap(subcommand)]
+    subcommand: Commands,
+
+    #[clap(long = "verbose", short = 'v', action = clap::ArgAction::Count)]
+    verbosity: u8,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    #[clap(name = "build")]
+    /// Package a Docker image into a self-executing Nova Enclave Capsule image.
+    Build {
+        #[clap(long = "file", short = 'f', default_value = "capsule.yaml")]
+        /// Path to the `capsule.yaml` manifest, or `-` to read it from stdin.
+        manifest_file: String,
+
+        #[clap(long = "eif-only", hide = true)]
+        /// Only build the EIF file, do not package it into a self-executing image.
+        eif_file: Option<String>,
+
+        #[clap(long = "pull")]
+        /// Pull every container image to ensure the latest version
+        force_pull: bool,
+    },
+
+    #[clap(name = "run")]
+    /// Run a packaged Nova Enclave Capsule image without typing long Docker commands.
+    ///
+    /// This command is a convenience utility that runs a pre-existing Nova Enclave Capsule image
+    /// in the local Docker Daemon. It is equivalent to running the image with Docker,
+    /// and passing:
+    ///
+    ///     '--device=/dev/nitro_enclaves:/dev/nitro_enclaves:rw'.
+    ///
+    /// Requires a local Docker Daemon to be running, and that this computer is an AWS
+    /// instance configured to support Nitro Enclaves.
+    Run {
+        #[clap(long = "file", short = 'f')]
+        /// Nova Enclave Capsule Manifest file in which to look for an image name.
+        ///
+        /// Defaults to capsule.yaml if not set and no image is specified. To run a specific
+        /// image instead, pass the name of the image as an argument.
+        manifest_file: Option<String>,
+
+        #[clap(index = 1, name = "image")]
+        /// Name of a pre-existing Nova Enclave Capsule image to run.
+        ///
+        /// To automatically look this value up from a Nova Enclave Capsule manifest, use `-f`, or
+        /// execute this command with a `capsule.yaml` file in the current directory.
+        image_name: Option<String>,
+
+        #[clap(short = 'p', long = "publish")]
+        /// Port to expose on the host machine, for example: 8080:80.
+        port_forwards: Vec<String>,
+
+        #[clap(short, long)]
+        /// Run the enclave supervisor in debug mode
+        debug_mode: bool,
+
+        #[clap(long)]
+        /// Number of vCPUs to assign to the enclave
+        cpu_count: Option<i32>,
+
+        #[clap(long)]
+        /// Enclave memory in MiB
+        memory_mb: Option<i32>,
+
+        #[clap(long = "mount")]
+        /// Host-backed mount in the form NAME=HOST_STATE_DIR.
+        mounts: Vec<String>,
+    },
+}
+
+async fn run(args: Cli) -> Result<()> {
+    match args.subcommand {
+        // Build an OCI image based on a manifest file.
+        Commands::Build {
+            manifest_file,
+            eif_file: None,
+            force_pull,
+        } => {
+            let builder = EnclaveArtifactBuilder::new(force_pull)?;
+            let (eif_info, resolved_sources, release_img) =
+                builder.build_release(&manifest_file).await?;
+
+            let build_summary = BuildSummary {
+                sources: resolved_sources,
+                measurements: eif_info.measurements,
+                image: release_img,
+            };
+
+            serde_json::to_writer_pretty(std::io::stdout(), &build_summary)?;
+            println!();
+
+            Ok(())
+        }
+
+        // Build an EIF file based on a manifest file (useful for debugging, not meant for production use).
+        Commands::Build {
+            manifest_file,
+            eif_file: Some(eif_file),
+            force_pull,
+            ..
+        } => {
+            let builder = EnclaveArtifactBuilder::new(force_pull)?;
+            let (eif_info, eif_path) = builder.build_eif_only(&manifest_file, &eif_file).await?;
+
+            println!("Built EIF: {}", eif_path.display());
+            println!("EIF Info:");
+
+            serde_json::to_writer_pretty(std::io::stdout(), &eif_info)?;
+            println!();
+
+            Ok(())
+        }
+
+        // Run a packaged Capsule image.
+        Commands::Run {
+            manifest_file,
+            image_name,
+            port_forwards,
+            debug_mode,
+            cpu_count,
+            memory_mb,
+            mounts,
+        } => {
+            let (image_name, manifest) = match (manifest_file, image_name) {
+                // If an image was specified, use it
+                (None, Some(image_name)) => {
+                    if !mounts.is_empty() {
+                        Err(anyhow!(
+                            "--mount requires loading a manifest via --file or the default capsule.yaml"
+                        ))
+                    } else {
+                        Ok((image_name, None))
+                    }
+                }
+
+                // If no image was specified, either use the specified manifest file or the default
+                // to try to look up the target image name.
+                (manifest_file, None) => {
+                    let manifest_file =
+                        manifest_file.unwrap_or_else(|| MANIFEST_FILE_NAME.to_string());
+                    let manifest = load_manifest(manifest_file).await?;
+                    Ok((manifest.target.clone(), Some(manifest)))
+                }
+
+                // Specifying both is an error
+                (Some(_), Some(_)) => Err(anyhow!(
+                    "both an image name and a manifest file were specified"
+                )),
+            }?;
+
+            let hostfs_mounts = if mounts.is_empty() {
+                Vec::new()
+            } else {
+                let manifest = manifest.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "--mount requires loading a manifest via --file or the default capsule.yaml"
+                    )
+                })?;
+                let runtime_bindings = mounts
+                    .iter()
+                    .map(|spec| parse_runtime_mount_binding(spec))
+                    .collect::<Result<Vec<_>>>()?;
+                resolve_loopback_mounts(manifest, &runtime_bindings)?
+            };
+
+            let mut runner = CapsuleShell::new()?;
+
+            let shutdown_signal = capsule_cli::utils::register_shutdown_signal_handler().await?;
+
+            tokio::select! {
+                res = runner.run_capsule_image(
+                    &image_name,
+                    port_forwards,
+                    debug_mode,
+                    cpu_count,
+                    memory_mb,
+                    hostfs_mounts,
+                ) => {
+                    debug!("enclave exited");
+                    match res {
+                        Ok(_) => debug!("enclave exited successfully"),
+                        Err(e) => error!("error running enclave: {e:#}"),
+                    }
+                }
+                _ = shutdown_signal => {
+                    debug!("signal received, cleaning up...");
+                }
+            }
+
+            runner.cleanup().await?;
+
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct BuildSummary {
+    #[serde(rename = "Sources")]
+    sources: ResolvedSources,
+
+    #[serde(rename = "Measurements")]
+    measurements: EIFMeasurements,
+
+    #[serde(rename = "Image")]
+    image: ImageRef,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Cli::parse();
+    capsule_cli::utils::init_logging(args.verbosity);
+
+    #[cfg(feature = "tracing")]
+    console_subscriber::ConsoleLayer::builder()
+        .with_default_env()
+        .server_addr(([127, 0, 0, 1], 51002));
+
+    run(args).await
+}

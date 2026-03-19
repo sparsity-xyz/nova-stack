@@ -1,0 +1,272 @@
+use anyhow::{Result, anyhow};
+use bollard::Docker;
+use bollard::container::LogOutput;
+use bollard::models::{ContainerCreateBody, DeviceMapping, HostConfig, PortBinding, PortMap};
+use bollard::query_parameters::{
+    CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
+    StopContainerOptions, WaitContainerOptions,
+};
+use futures_util::stream::{StreamExt, TryStreamExt};
+use log::{info, warn};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+
+use crate::hostfs::{LoopbackMountRequest, PreparedLoopbackMount, prepare_loopback_mounts};
+
+pub struct CapsuleShell {
+    docker: Arc<Docker>,
+    container_id: Option<String>,
+    stream_task: Option<tokio::task::JoinHandle<()>>,
+    hostfs_mounts: Vec<PreparedLoopbackMount>,
+}
+
+impl CapsuleShell {
+    pub fn new() -> Result<Self> {
+        let docker_client = Arc::new(
+            Docker::connect_with_local_defaults()
+                .map_err(|e| anyhow!("connecting to docker: {}", e))?,
+        );
+
+        Ok(Self {
+            docker: docker_client,
+            container_id: None,
+            stream_task: None,
+            hostfs_mounts: Vec::new(),
+        })
+    }
+
+    pub async fn run_capsule_image(
+        &mut self,
+        image_name: &str,
+        port_forwards: Vec<String>,
+        debug_mode: bool,
+        cpu_count: Option<i32>,
+        memory_mb: Option<i32>,
+        loopback_mount_requests: Vec<LoopbackMountRequest>,
+    ) -> Result<()> {
+        if self.container_id.is_some() {
+            return Err(anyhow!("container already running"));
+        }
+        if !self.hostfs_mounts.is_empty() {
+            return Err(anyhow!("hostfs mounts already prepared"));
+        }
+
+        let port_re = regex::Regex::new(r"^(\d+):(\d+)$")?;
+
+        let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
+        let mut port_bindings = PortMap::new();
+
+        for spec in port_forwards {
+            let captures = port_re.captures(&spec).ok_or_else(|| {
+                anyhow!(
+                    "port forward specification '{spec}' does not match the format 'host_port:container_port'",
+                )
+            })?;
+            let host_port = captures.get(1).unwrap().as_str();
+            let container_port = captures.get(2).unwrap().as_str();
+            exposed_ports.insert(format!("{container_port}/tcp"), HashMap::new());
+
+            port_bindings.insert(
+                format!("{container_port}/tcp"),
+                Some(vec![PortBinding {
+                    host_port: Some(host_port.to_string()),
+                    host_ip: None,
+                }]),
+            );
+        }
+
+        if !loopback_mount_requests.is_empty() {
+            for request in &loopback_mount_requests {
+                info!(
+                    "Hostfs preflight: mount='{}' host_state_dir={} container_path={} enclave_path={} size_mb={} required={}",
+                    request.name,
+                    request.host_state_dir.display(),
+                    request.container_mount_path.display(),
+                    request.enclave_mount_path.display(),
+                    request.size_mb,
+                    request.required
+                );
+            }
+
+            // Prepare or reuse the loopback-backed host directories before the
+            // Capsule Shell container starts, then bind-mount them in for hostfs proxying.
+            self.hostfs_mounts = tokio::task::spawn_blocking(move || {
+                prepare_loopback_mounts(&loopback_mount_requests)
+            })
+            .await??;
+        }
+        let bind_mounts = if self.hostfs_mounts.is_empty() {
+            None
+        } else {
+            Some(
+                self.hostfs_mounts
+                    .iter()
+                    .map(PreparedLoopbackMount::container_bind)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let container_id = self
+            .docker
+            .create_container(
+                None::<CreateContainerOptions>,
+                ContainerCreateBody {
+                    image: Some(image_name.to_string()),
+                    cmd: {
+                        let mut cmd = Vec::new();
+                        if debug_mode {
+                            cmd.push("--debug-mode".into());
+                        }
+                        if let Some(cpu_count) = cpu_count {
+                            cmd.push("--cpu-count".into());
+                            cmd.push(cpu_count.to_string());
+                        }
+                        if let Some(memory_mb) = memory_mb {
+                            cmd.push("--memory-mb".into());
+                            cmd.push(memory_mb.to_string());
+                        }
+
+                        if cmd.is_empty() { None } else { Some(cmd) }
+                    },
+                    attach_stderr: Some(true),
+                    attach_stdout: Some(true),
+                    host_config: Some(HostConfig {
+                        devices: Some(vec![DeviceMapping {
+                            path_on_host: Some(String::from("/dev/nitro_enclaves")),
+                            path_in_container: Some(String::from("/dev/nitro_enclaves")),
+                            cgroup_permissions: Some(String::from("rwm")),
+                        }]),
+                        binds: bind_mounts,
+                        port_bindings: Some(port_bindings),
+                        privileged: Some(true),
+                        ..Default::default()
+                    }),
+                    exposed_ports: Some(exposed_ports),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .id;
+
+        self.container_id = Some(container_id.clone());
+
+        info!(
+            "Starting capsule-shell container image={} debug_mode={} cpu_count={:?} memory_mb={:?}",
+            image_name, debug_mode, cpu_count, memory_mb
+        );
+
+        self.docker
+            .start_container(&container_id, None::<StartContainerOptions>)
+            .await?;
+
+        self.start_output_stream_task(container_id.clone()).await?;
+
+        let status_code = self
+            .docker
+            .wait_container(&container_id, None::<WaitContainerOptions>)
+            .try_collect::<Vec<_>>()
+            .await?
+            .first()
+            .ok_or_else(|| anyhow!("missing wait response from daemon",))?
+            .status_code;
+
+        if status_code != 0 {
+            return Err(anyhow!("non-zero exit code from container",));
+        }
+
+        // Remove the container after it successfully exits.
+        self.docker
+            .remove_container(&container_id, None::<RemoveContainerOptions>)
+            .await?;
+        self.container_id = None;
+
+        Ok(())
+    }
+
+    async fn start_output_stream_task(&mut self, container_id: String) -> Result<()> {
+        let mut stdout = tokio::io::stdout();
+        let mut stderr = tokio::io::stderr();
+
+        let mut log_stream = self.docker.logs(
+            &container_id,
+            Some(LogsOptions {
+                follow: true,
+                stdout: true,
+                stderr: true,
+                ..Default::default()
+            }),
+        );
+
+        self.stream_task = Some(tokio::task::spawn(async move {
+            while let Some(Ok(item)) = log_stream.next().await {
+                match item {
+                    LogOutput::StdOut { message } => {
+                        if let Err(err) = stdout.write_all(&message).await {
+                            warn!(
+                                "stopping capsule-shell stdout stream after write failure: {err}"
+                            );
+                            break;
+                        }
+                    }
+                    LogOutput::StdErr { message } => {
+                        if let Err(err) = stderr.write_all(&message).await {
+                            warn!(
+                                "stopping capsule-shell stderr stream after write failure: {err}"
+                            );
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }));
+
+        Ok(())
+    }
+
+    pub async fn cleanup(&mut self) -> Result<()> {
+        let mut first_error = None;
+
+        if let Some(container_id) = self.container_id.take() {
+            if let Err(err) = self
+                .docker
+                .stop_container(&container_id, None::<StopContainerOptions>)
+                .await
+            {
+                first_error = Some(anyhow!("stopping container: {}", err));
+            }
+
+            if let Err(err) = self
+                .docker
+                .remove_container(&container_id, None::<RemoveContainerOptions>)
+                .await
+                && first_error.is_none()
+            {
+                first_error = Some(anyhow!("removing container: {}", err));
+            }
+        }
+
+        if let Some(stream_task) = self.stream_task.take()
+            && let Err(err) = stream_task.await
+            && first_error.is_none()
+        {
+            first_error = Some(anyhow!("waiting for container log stream: {}", err));
+        }
+
+        for mount in self.hostfs_mounts.iter_mut().rev() {
+            if let Err(err) = mount.cleanup()
+                && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+        self.hostfs_mounts.clear();
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        Ok(())
+    }
+}

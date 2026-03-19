@@ -1,0 +1,153 @@
+# Nova Enclave Capsule Port Handling
+
+This document explains how Nova Enclave Capsule handles ports end-to-end, within Nova Enclave Capsule itself.
+
+Scope:
+- Included: `capsule-cli build`, `capsule-cli run`, `capsule-shell` (capsule-shell), `capsule-runtime`, `ingress`, API/Aux API/Helios listeners.
+- Excluded: external reverse proxies and platform-specific ingress layers.
+
+For a deeper explanation of the CID-derived host-side VSOCK model, see
+`docs/vsock_runtime.md`.
+
+Multi-instance support:
+- Multiple `capsule-cli run` processes can run on the same EC2 instance.
+- `capsule-shell` picks a managed enclave CID for each instance and derives host-side VSOCK listeners for egress, clock sync, and hostfs from that CID.
+- Docker-published TCP ports (`-p host:container`) still need to be unique per container, just like normal Docker workloads.
+
+## Port Layers
+
+Nova Enclave Capsule networking has three relevant layers:
+
+1. Host -> Capsule Shell container (`docker` port publishing)
+   - Controlled by `capsule-cli run -p HOST_PORT:CONTAINER_PORT`.
+
+2. Capsule Shell container TCP -> Enclave vsock (`HostProxy`)
+   - Controlled by `manifest.ingress[].listen_port`.
+   - Started by `capsule-shell` inside the capsule-shell container.
+
+3. Enclave vsock -> Enclave localhost TCP (`EnclaveProxy`)
+   - Controlled by `manifest.ingress[].listen_port`.
+   - Started by `capsule-runtime` inside the enclave.
+
+For inbound traffic to work, all required layers must align.
+
+## Who Reads Which Config
+
+### `capsule-cli build`
+
+- Reads `capsule.yaml`.
+- Packages the manifest into the release image (`/enclave/capsule.yaml`) for capsule-shell.
+- Also injects manifest into the enclave app layer (`/etc/capsule/capsule.yaml`) for capsule-runtime.
+
+### `capsule-cli run` (CLI)
+
+- `-f/--file` is used to resolve `manifest.target` when image name is not provided.
+- `-f/--file` (or the default local `capsule.yaml`) is also how runtime `--mount` bindings are resolved against `storage.mounts[]`.
+- `--publish/-p` is the only source of Docker host port publishing.
+- `--mount` is rejected in image-name-only mode because there is no manifest to resolve.
+- It does not auto-publish ports from `manifest.ingress`.
+
+### `capsule-shell` (capsule-shell runtime in container)
+
+- Loads packaged manifest.
+- Chooses a managed enclave CID and launches Nitro CLI with that explicit CID.
+- Starts host-side ingress proxies for each `manifest.ingress[].listen_port`.
+- Each proxy listens on container `0.0.0.0:<listen_port>` and forwards to enclave vsock `<listen_port>`.
+- Starts host-side runtime VSOCK listeners for egress (when enabled), clock sync, and hostfs on ports derived from the managed CID.
+
+### `capsule-runtime` (inside enclave)
+
+- Loads manifest from `/etc/capsule/capsule.yaml`.
+- Starts enclave-side ingress listeners for each `manifest.ingress[].listen_port`.
+- For each incoming vsock stream, forwards to `127.0.0.1:<listen_port>` in enclave.
+
+## Service Ports vs Ingress Ports
+
+Application services are typically localhost listeners inside enclave:
+
+- App service: usually your app port (example `8080`)
+- Capsule API: `api.listen_port` (example `18000`)
+- Aux API: `aux_api.listen_port` if set, otherwise `api.listen_port + 1`
+  - Aux API is part of the API contract because attestation flows depend on it
+  - if `api.listen_port + 1` would overflow `u16`, the manifest must set `aux_api.listen_port` explicitly
+- Helios RPC: `helios_rpc.chains[].local_rpc_port` (per-chain port, often `18545` for Nova registry discovery)
+
+These are not externally reachable by default. They become reachable only if:
+
+1. The same port is listed in `ingress`.
+2. The port is published via `capsule-cli run -p host:container`.
+
+## Practical Example
+
+Manifest:
+
+```yaml
+ingress:
+  - listen_port: 8080
+  - listen_port: 18001
+
+api:
+  listen_port: 18000
+aux_api:
+  listen_port: 18001
+```
+
+Run:
+
+```bash
+capsule-cli run my-image:latest \
+  -p 8000:8080 \
+  -p 8001:18001
+```
+
+Result:
+
+- Host `:8000` -> container `:8080` -> enclave app `127.0.0.1:8080`
+- Host `:8001` -> container `:18001` -> enclave aux API `127.0.0.1:18001`
+- Capsule API `18000` is still not externally reachable (not in `ingress` and not published)
+
+## Host-side Runtime VSOCK Ports
+
+The fixed VSOCK ports inside the enclave are:
+
+- `17000` for app status
+- `17001` for app log streaming
+
+Host-side runtime listeners are not fixed globally. Nova Enclave Capsule derives them from
+the managed enclave CID using a per-CID VSOCK block:
+
+- egress: `20000 + (CID * 128) + 0`
+- clock sync: `20000 + (CID * 128) + 1`
+- hostfs mount `N`: `20000 + (CID * 128) + 16 + N`
+
+That is what allows multiple Nova Enclave Capsule instances on one EC2 to run without
+colliding on host-side runtime VSOCK listeners.
+
+## Common Pitfalls
+
+1. Added `ingress` entry but forgot `-p`
+   - Proxy exists in capsule-shell, but host cannot reach container port.
+
+2. Added `-p` but port not in `ingress`
+   - Docker forwards to container port, but no `HostProxy` is listening there.
+
+3. Added `ingress` and `-p`, but service is not listening in enclave
+   - `EnclaveProxy` forwards to `127.0.0.1:<port>` and connection fails.
+
+4. Protocol mismatch on ingress port
+   - Example: sending REST-style requests to a JSON-RPC endpoint.
+
+5. Used `--mount` without loading a manifest
+   - Runtime mount resolution needs `storage.mounts[]` from `-f` or the default local `capsule.yaml`.
+
+6. Changed `storage.mounts[]` order without realizing it affects hostfs VSOCK ports
+   - Host and enclave both derive mount ports from manifest order.
+
+## Validation Checklist
+
+To expose a new port safely:
+
+1. Service inside enclave listens on `127.0.0.1:<PORT>`.
+2. `ingress` includes `listen_port: <PORT>`.
+3. `capsule-cli run` includes `-p HOST_PORT:<PORT>`.
+4. Endpoint/protocol test matches service behavior (for example JSON-RPC vs REST path style).

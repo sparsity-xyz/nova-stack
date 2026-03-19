@@ -18,11 +18,11 @@ Nova Stack consists of four core components that together provide a complete, en
 │   1. DEVELOP              2. BUILD               3. DEPLOY             4. REGISTER       │
 │   ──────────              ────────               ────────              ────────────      │
 │   ┌────────────┐          ┌────────────┐         ┌────────────┐        ┌────────────┐    │
-│   │  Enclaver  │  ──────▶ │  App Hub   │ ──────▶ │  Enclaver  │ ─────▶ │  ZKP CLI   │    │
+│   │  Capsule   │  ──────▶ │  App Hub   │ ──────▶ │  Capsule   │ ─────▶ │  ZKP CLI   │    │
 │   │            │          │            │         │            │        │            │    │
 │   │ Build &    │          │ Transparent│         │ Run your   │        │ Attest,    │    │
-│   │ test your  │          │ CI/CD build│         │ EIF on AWS │        │ Prove &    │    │
-│   │ TEE app    │          │ with proofs│         │ Nitro      │        │ Register   │    │
+│   │ test your  │          │ CI/CD build│         │ release    │        │ Prove &    │    │
+│   │ TEE app    │          │ with proofs│         │ image      │        │ Register   │    │
 │   └────────────┘          └─────┬──────┘         └────────────┘        └─────┬──────┘    │
 │                                 │ Upload hash                                │ Verify &  │
 │                                 ▼                                            ▼ Register  │
@@ -33,9 +33,9 @@ Nova Stack consists of four core components that together provide a complete, en
 └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-1. **Develop**: Use **Enclaver** to build and test your TEE application locally in mock mode or on a real Nitro Enclave.
+1. **Develop**: Use **Nova Enclave Capsule** to build and test your TEE application locally in mock mode or on a real Nitro Enclave.
 2. **Build**: Use **App Hub** (or your own CI/CD) to transparently build your application, producing a verifiable EIF and measurement (PCRs). The measurements are enrolled into the on-chain registry as a new **Version**.
-3. **Deploy**: Use **Enclaver** to run the built EIF on your own AWS EC2 instances with Nitro Enclave support.
+3. **Deploy**: Use **Nova Enclave Capsule** to run the built release image, which contains the EIF, on your own AWS EC2 instances with Nitro Enclave support.
 4. **Register**: Use **ZKP CLI** to obtain remote attestation from your running enclave, generate a Zero-Knowledge Proof, and register your **Instance** on-chain in the **App Registry** by verifying it against the enrolled version.
 
 Learn more about this workflow at [https://sparsity.cloud/how-it-works](https://sparsity.cloud/how-it-works).
@@ -46,24 +46,21 @@ Learn more about this workflow at [https://sparsity.cloud/how-it-works](https://
 
 Note that this repo contains the latest released version of the components, while they are being actively developed in the original repos.
 
-### 1. Enclaver
+### 1. Nova Enclave Capsule
 **The Development & Runtime Engine**  
-[./enclaver/](./enclaver/)  
-*Original Repo: [https://github.com/sparsity-xyz/enclaver/](https://github.com/sparsity-xyz/enclaver/)*
+[./enclave-capsule/](./enclave-capsule/)  
+*Original Repo: [https://github.com/sparsity-xyz/nova-enclave-capsule](https://github.com/sparsity-xyz/nova-enclave-capsule)*
 
-Enclaver is the core toolkit for the entire lifecycle of AWS Nitro Enclave applications - from development to production. It builds a Docker image into an Enclave Image File (EIF), runs the enclave, and provides a runtime supervisor called **Odyn** that manages your application inside the enclave.
+Nova Enclave Capsule is the core toolkit for the entire lifecycle of AWS Nitro Enclave applications, from local development to production deployment. It uses `capsule-cli build` plus a `capsule.yaml` manifest to turn a standard container image into a release image with an embedded EIF, and `capsule-cli run` to launch that image on Nitro-enabled EC2. Inside the enclave, `capsule-runtime` supervises the application, while `capsule-shell` manages the host-side runtime and Nitro lifecycle.
 
 #### Key Features
 
-*   **Networking & Proxies**: Nitro Enclaves have no native networking. Enclaver provides transparent Ingress (TCP) and Egress (HTTP) proxies so your app can communicate with the outside world using standard protocols.
-*   **Odyn Supervisor**: The PID 1 process inside the enclave. It manages your application lifecycle, proxies, and provides an internal API for security primitives.
+*   **Capsule CLI Workflow**: Build and run enclave applications with `capsule-cli build` and `capsule-cli run`, using a single `capsule.yaml` manifest to describe the runtime contract.
+*   **Networking & Proxies**: Nitro Enclaves have no native networking. Nova Enclave Capsule provides ingress and egress proxy layers so your app can communicate with the outside world using standard protocols.
+*   **Capsule Runtime & Capsule API**: `capsule-runtime` runs as PID 1 inside the enclave and exposes local HTTP APIs for attestation, randomness, signing, encryption, storage, and related enclave services.
 *   **Trustless RPC (Helios)**: Includes a built-in **Helios Light Client** that syncs with Ethereum/OP Stack chains. Your app gets a local, trustless JSON-RPC endpoint (`http://localhost:8545`) verified by cryptographic proofs, eliminating reliance on trusted 3rd party RPCs.
-*   **Persistent Storage (S3)**: An encrypted, isolated storage layer backed by AWS S3. The enclave uses its unique identity to read/write data securely, allowing stateful apps to run in a stateless enclave environment.
-*   **Internal Security API**: A local HTTP API (`http://localhost:9000`) for:
-    *   **Attestation**: Generating cryptographic proofs of the enclave's identity (PCRs).
-    *   **Key Management**: Signing transactions with enclave-generated keys.
-    *   **Encryption**: ECIES (ECDH + AES-GCM) for secure communication with clients.
-    *   **Randomness**: Hardware-based true random number generation from the NSM.
+*   **Storage & Mounts**: Supports encrypted S3-backed storage as well as host-backed directory mounts for stateful enclave workloads.
+*   **KMS-Backed Key Management**: Integrates enclave identity with external KMS-backed signing and derivation flows for application wallets and related services.
 
 ### 2. App Hub
 **The Transparent Builder**  
@@ -116,7 +113,8 @@ A command-line tool for the final step of the deployment pipeline. It connects t
 ### Step 1: Develop Your Application
 
 1.  Check the [Sparsity Nova Examples](https://github.com/sparsity-xyz/sparsity-nova-examples) for reference implementations.
-2.  Use **Enclaver** to build and test your application locally:
+2.  Use **Nova Enclave Capsule** and a `capsule.yaml` manifest to build and test your application locally.
+3.  Start with the [Nova Enclave Capsule README](./enclave-capsule/README.md) or the [HN Fetcher example](./enclave-capsule/examples/hn-fetcher/readme.md).
 
 
 ### Step 2: Build Transparently
@@ -128,8 +126,8 @@ A command-line tool for the final step of the deployment pipeline. It connects t
 ### Step 3: Deploy to AWS
 
 1.  Launch an EC2 instance with Nitro Enclave support in your own AWS account.
-2.  Deploy the built EIF using the Enclaver runtime.
-3.  Your enclave is now running and accessible.
+2.  Deploy the built release image using `capsule-cli run`.
+3.  Your enclave is now running and accessible through the ports you publish from the Capsule release image.
 
 ### Step 4: Register On-Chain
 
@@ -154,6 +152,7 @@ A command-line tool for the final step of the deployment pipeline. It connects t
 - [How It Works](https://sparsity.cloud/how-it-works)
 - [Nova App Template](https://github.com/sparsity-xyz/nova-app-template)
 - [Nova App Examples](https://github.com/sparsity-xyz/sparsity-nova-examples)
-- [Enclaver Documentation](./enclaver/docs/)
+- [Nova Enclave Capsule](./enclave-capsule/README.md)
+- [Nova Enclave Capsule Documentation](./enclave-capsule/docs/)
 - [App Registry Documentation](./app-registry/README.md)
 - [Sparsity Cloud (With Managed Nova Stack)](https://sparsity.cloud) - Optional managed platform for simplified deployment

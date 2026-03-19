@@ -1,0 +1,200 @@
+name: CI
+
+on:
+  push:
+    tags-ignore:
+      - '**'
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: "sparse"
+
+jobs:
+  fmt-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Parse MSRV
+        run: sed -n 's/^rust-version = "\(.*\)"$/RUSTUP_TOOLCHAIN=\1/p' capsule-cli/Cargo.toml >> $GITHUB_ENV
+
+      - name: Install Rust Toolchain
+        run: rustup toolchain install $RUSTUP_TOOLCHAIN
+
+      - name: Install Rustfmt
+        run: rustup component add rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --manifest-path capsule-cli/Cargo.toml --all -- --check
+
+  clippy-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: default
+            features: ""
+            rustflags: "-Dwarnings"
+          - id: run-enclave-capsule-runtime
+            features: "run_enclave,capsule_runtime"
+            rustflags: "-Dwarnings"
+          - id: run-enclave-capsule-runtime-tracing
+            features: "run_enclave,capsule_runtime,tracing"
+            rustflags: "--cfg=tokio_unstable -Dwarnings"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Parse MSRV
+        run: sed -n 's/^rust-version = "\(.*\)"$/RUSTUP_TOOLCHAIN=\1/p' capsule-cli/Cargo.toml >> $GITHUB_ENV
+
+      - name: Install Rust Toolchain
+        run: rustup toolchain install $RUSTUP_TOOLCHAIN
+
+      - name: Install Clippy
+        run: rustup component add clippy
+
+      - name: Cache Cargo registry and git data
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.cargo/git/checkouts/
+          key: ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('capsule-cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Cache Rust target directory
+        uses: actions/cache@v5
+        with:
+          path: capsule-cli/target
+          key: ${{ runner.os }}-target-${{ env.RUSTUP_TOOLCHAIN }}-clippy-${{ matrix.id }}-${{ hashFiles('capsule-cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ env.RUSTUP_TOOLCHAIN }}-clippy-${{ matrix.id }}-
+            ${{ runner.os }}-target-${{ env.RUSTUP_TOOLCHAIN }}-
+
+      - name: Check with clippy (${{ matrix.id }})
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          if [[ -z "${{ matrix.features }}" ]]; then
+            cargo clippy --quiet --no-deps --manifest-path capsule-cli/Cargo.toml
+          else
+            cargo clippy --quiet --no-deps --manifest-path capsule-cli/Cargo.toml --features="${{ matrix.features }}"
+          fi
+
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: default
+            features: ""
+          - id: run-enclave
+            features: "run_enclave"
+          - id: capsule-runtime
+            features: "capsule_runtime"
+          - id: run-enclave-capsule-runtime
+            features: "run_enclave,capsule_runtime"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Parse MSRV
+        run: sed -n 's/^rust-version = "\(.*\)"$/RUSTUP_TOOLCHAIN=\1/p' capsule-cli/Cargo.toml >> $GITHUB_ENV
+
+      - name: Install Rust Toolchain
+        run: rustup toolchain install $RUSTUP_TOOLCHAIN
+
+      - name: Cache Cargo registry and git data
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.cargo/git/checkouts/
+          key: ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('capsule-cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Cache Rust target directory
+        uses: actions/cache@v5
+        with:
+          path: capsule-cli/target
+          key: ${{ runner.os }}-target-${{ env.RUSTUP_TOOLCHAIN }}-test-${{ matrix.id }}-${{ hashFiles('capsule-cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ env.RUSTUP_TOOLCHAIN }}-test-${{ matrix.id }}-
+            ${{ runner.os }}-target-${{ env.RUSTUP_TOOLCHAIN }}-test-
+            ${{ runner.os }}-target-${{ env.RUSTUP_TOOLCHAIN }}-
+
+      - name: Run tests (${{ matrix.id }})
+        run: |
+          if [[ -z "${{ matrix.features }}" ]]; then
+            cargo test --quiet --manifest-path capsule-cli/Cargo.toml
+          else
+            cargo test --quiet --manifest-path capsule-cli/Cargo.toml --features="${{ matrix.features }}"
+          fi
+
+  capsule-build-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Parse MSRV
+        run: sed -n 's/^rust-version = "\(.*\)"$/RUSTUP_TOOLCHAIN=\1/p' capsule-cli/Cargo.toml >> $GITHUB_ENV
+
+      - name: Install Rust Toolchain
+        run: rustup toolchain install $RUSTUP_TOOLCHAIN
+
+      - name: Cache Cargo registry and git data
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            ~/.cargo/git/checkouts/
+          key: ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('capsule-cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Cache Rust target directory
+        uses: actions/cache@v5
+        with:
+          path: capsule-cli/target
+          key: ${{ runner.os }}-target-${{ env.RUSTUP_TOOLCHAIN }}-smoke-${{ hashFiles('capsule-cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-target-${{ env.RUSTUP_TOOLCHAIN }}-smoke-
+            ${{ runner.os }}-target-${{ env.RUSTUP_TOOLCHAIN }}-
+
+      - name: Build capsule-cli
+        run: cargo build --quiet --manifest-path capsule-cli/Cargo.toml --bin capsule-cli
+
+      - name: Smoke test capsule-cli build
+        env:
+          CAPSULE_CLI_BIN: ${{ github.workspace }}/capsule-cli/target/debug/capsule-cli
+          CAPSULE_CLI_SMOKE_MODE: fixture
+        run: ./scripts/capsule-build-smoke-test.sh
