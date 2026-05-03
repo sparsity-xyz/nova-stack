@@ -87,6 +87,28 @@ enum Commands {
         /// Host-backed mount in the form NAME=HOST_STATE_DIR.
         mounts: Vec<String>,
     },
+
+    #[clap(name = "verify")]
+    /// Verify that an EIF's PCR measurements match a build attestation.
+    ///
+    /// This closes the trust loop App Hub opens: builds emit a signed
+    /// build-attestation.json with PCR measurements, but until now there has
+    /// been no client-side tool to confirm the released EIF actually matches
+    /// the attestation. `verify` shells out to nitro-cli describe-eif and
+    /// compares each PCR.
+    Verify {
+        #[clap(long = "eif", short = 'e')]
+        /// Path to the EIF file (or release image's embedded EIF).
+        eif_path: std::path::PathBuf,
+
+        #[clap(long = "attestation", short = 'a')]
+        /// Path to a JSON file with PCR measurements (build-attestation.json).
+        attestation_path: std::path::PathBuf,
+
+        #[clap(long = "quiet", short = 'q')]
+        /// Suppress the comparison table; only emit success/failure summary.
+        quiet: bool,
+    },
 }
 
 async fn run(args: Cli) -> Result<()> {
@@ -212,6 +234,19 @@ async fn run(args: Cli) -> Result<()> {
 
             Ok(())
         }
+
+        Commands::Verify {
+            eif_path,
+            attestation_path,
+            quiet,
+        } => match capsule_cli::verify::run_verify(&eif_path, &attestation_path, quiet).await {
+            Ok(0) => Ok(()),
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                std::process::exit(2);
+            }
+        },
     }
 }
 

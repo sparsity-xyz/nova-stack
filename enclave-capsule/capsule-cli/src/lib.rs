@@ -13,6 +13,7 @@ pub mod constants;
 
 pub mod nitro_cli;
 pub mod nitro_cli_container;
+pub mod verify;
 
 pub mod manifest;
 
