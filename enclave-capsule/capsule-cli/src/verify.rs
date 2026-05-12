@@ -9,7 +9,7 @@ const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
 /// Loaded attestation - permissive parser that accepts uppercase, lowercase,
-/// and nested (`{"measurements": {...}}`) shapes from various tooling.
+/// and nested (`{"enclave": {...}}` / `{"measurements": {...}}`) shapes from various tooling.
 #[derive(Debug, Clone)]
 pub struct AttestationMeasurements {
     pub pcr0: String,
@@ -28,6 +28,8 @@ struct RawAttestation {
     pcr2: Option<String>,
     #[serde(rename = "PCR8", alias = "pcr8")]
     pcr8: Option<String>,
+    #[serde(rename = "enclave", alias = "Enclave")]
+    enclave: Option<NestedMeasurements>,
     #[serde(rename = "measurements", alias = "Measurements")]
     measurements: Option<NestedMeasurements>,
 }
@@ -51,7 +53,7 @@ impl AttestationMeasurements {
         let raw: RawAttestation = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse attestation JSON {}", path.display()))?;
 
-        let (pcr0, pcr1, pcr2, pcr8) = match raw.measurements {
+        let (pcr0, pcr1, pcr2, pcr8) = match raw.enclave.or(raw.measurements) {
             Some(nested) => (nested.pcr0, nested.pcr1, nested.pcr2, nested.pcr8),
             None => (raw.pcr0, raw.pcr1, raw.pcr2, raw.pcr8),
         };
@@ -201,6 +203,17 @@ mod tests {
         let f = write_temp(r#"{"Measurements":{"PCR0":"aa","PCR1":"bb","PCR2":"cc"}}"#);
         let a = AttestationMeasurements::from_file(f.path()).unwrap();
         assert_eq!(a.pcr0, "aa");
+    }
+
+    #[test]
+    fn parses_production_enclave_schema() {
+        let f = write_temp(
+            r#"{"schema_version":"1.0","enclave":{"pcr0":"aa","pcr1":"bb","pcr2":"cc"}}"#,
+        );
+        let a = AttestationMeasurements::from_file(f.path()).unwrap();
+        assert_eq!(a.pcr0, "aa");
+        assert_eq!(a.pcr1, "bb");
+        assert_eq!(a.pcr2, "cc");
     }
 
     #[test]
